@@ -1,0 +1,6 @@
+subjects: 106
+total_samples: 190800
+coverage_mean: 0.9964675052410902
+mae_mean: 80.26224184083307
+rmse_mean: 82.65436601939871
+mean_band_mean: 1133.1051401070479
