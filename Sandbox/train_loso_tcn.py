@@ -15,6 +15,8 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.svm import SVR
 
 # -----------------------------
 # Utils
@@ -83,21 +85,38 @@ def build_windows(
     X_all: np.ndarray, spo2: np.ndarray, seq_len: int, stride: int
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    X_all: (7, N), spo2: (N,)
-    Return X: (num_windows, 7, seq_len), y: (num_windows,)
-    Label = mean SpO2 within the window (可依需求改成最後一點)
+    X_all: (C, N), spo2: (N,)
+    Return X: (num_windows, C, seq_len), y: (num_windows,)
+    Label = mean SpO2 within the window
     """
-    N = X_all.shape[1]
+    C, N = X_all.shape[0], X_all.shape[1]
     xs, ys = [], []
     for start in range(0, N - seq_len + 1, stride):
         end = start + seq_len
         xs.append(X_all[:, start:end])
         ys.append(float(spo2[start:end].mean()))
     if len(xs) == 0:
-        return np.zeros((0, 7, seq_len), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+        return np.zeros((0, C, seq_len), dtype=np.float32), np.zeros((0,), dtype=np.float32)
     X = np.stack(xs, axis=0).astype(np.float32)
     y = np.array(ys, dtype=np.float32)
     return X, y
+
+def apply_window_instance_norm_numpy(X: np.ndarray) -> np.ndarray:
+    """
+    對 numpy 格式的 (N, C, T) 做每個樣本、每通道的 instance normalization。
+    """
+    if X.size == 0:
+        return X
+    mu = X.mean(axis=2, keepdims=True)
+    std = X.std(axis=2, keepdims=True) + 1e-8
+    return (X - mu) / std
+
+def flatten_windows(X: np.ndarray) -> np.ndarray:
+    """(N, C, T) -> (N, C*T) 用於 sklearn 模型。"""
+    if X.ndim != 3:
+        return X
+    N, C, T = X.shape
+    return X.reshape(N, C * T)
 
 # -----------------------------
 # Dataset
@@ -309,12 +328,14 @@ def concat_except(subject_dict: Dict[str, Tuple[np.ndarray, np.ndarray]], exclud
 # -----------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", type=str, required=True, help="Path to data.csv")
+    # ---- 原有參數（保留） ----
+    parser.add_argument("--csv", type=str, help="Path to data.csv (LOSO mode)")
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--seq_sec", type=int, default=30, help="sequence length in seconds")
     parser.add_argument("--stride_sec", type=int, default=2, help="stride in seconds")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--hidden", type=int, default=64)
     parser.add_argument("--levels", type=int, default=3, help="number of TCN residual blocks")
     parser.add_argument("--kernel", type=int, default=5, help="TCN kernel size")
@@ -330,97 +351,261 @@ def main():
                         help="Append POS as an extra input channel (no HR prediction).")
     parser.add_argument("--pos_win", type=int, default=30,
                         help="Window length (in samples) for POS overlap-add (default 30 @ 30fps = 1s).")
-    args = parser.parse_args()
+    # ---- 新增參數 ----
+    parser.add_argument("--model", type=str, default="tcn",
+                        choices=["tcn", "rf", "svr"],
+                        help="選擇模型: tcn | rf (RandomForestRegressor) | svr (Support Vector Regressor)")
+    parser.add_argument("--rf_estimators", type=int, default=10, help="RandomForest 樹數")
+    parser.add_argument("--rf_max_depth", type=int, default=None, help="RandomForest 最大深度")
+    parser.add_argument("--svr_kernel", type=str, default="rbf", help="SVR kernel")
+    parser.add_argument("--svr_C", type=float, default=1.0, help="SVR C 參數")
+    parser.add_argument("--svr_gamma", type=str, default="scale", help="SVR gamma: scale | auto 或數值")
+    parser.add_argument("--mode", type=str, default="loso",
+                        choices=["loso", "fixed"],
+                        help="Evaluation mode: 'loso' (leave-one-subject-out) or 'fixed' (train/test CSV).")
+    parser.add_argument("--train_csv", type=str, default=None,
+                        help="Path to train_data.csv when --mode fixed")
+    parser.add_argument("--test_csv", type=str, default=None,
+                        help="Path to test_data.csv when --mode fixed")
 
+    args = parser.parse_args()
     set_seed(args.seed)
 
-    # Load
-    df = pd.read_csv(args.csv)
-    # Basic sanity check
+    device = torch.device(args.device)
+    print(f"Training Device: {args.device}")
+
     expected_cols = {"Folder","COLOR_R","COLOR_G","COLOR_B","SPO2"}
+
+    if args.mode == "fixed":
+        # --------- FIXED: 讀 train/test 兩檔 ---------
+        if not args.train_csv or not args.test_csv:
+            raise ValueError("When --mode fixed, please provide --train_csv and --test_csv.")
+        df_tr = pd.read_csv(args.train_csv)
+        df_te = pd.read_csv(args.test_csv)
+        if not expected_cols.issubset(df_tr.columns) or not expected_cols.issubset(df_te.columns):
+            raise ValueError(f"CSV must contain columns: {expected_cols}")
+
+        # 各自資料內建視窗（重要：train/test 各自做受試者內 z-score，避免洩漏）
+        subj_tr = prepare_subject_windows(
+            df_tr, fps=args.fps, seq_sec=args.seq_sec, stride_sec=args.stride_sec,
+            zscore_within_subject=(not args.no_zscore),
+            use_pos=args.use_pos, pos_win=args.pos_win
+        )
+        subj_te = prepare_subject_windows(
+            df_te, fps=args.fps, seq_sec=args.seq_sec, stride_sec=args.stride_sec,
+            zscore_within_subject=(not args.no_zscore),
+            use_pos=args.use_pos, pos_win=args.pos_win
+        )
+
+        # 合併所有 subject 成單一訓練/測試集合
+        if len(subj_tr) == 0 or len(subj_te) == 0:
+            raise ValueError("No train/test subjects produced windows. Check seq_sec/stride_sec.")
+        X_train = np.concatenate([v[0] for v in subj_tr.values()], axis=0)
+        y_train = np.concatenate([v[1] for v in subj_tr.values()], axis=0)
+        X_test  = np.concatenate([v[0] for v in subj_te.values()], axis=0)
+        y_test  = np.concatenate([v[1] for v in subj_te.values()], axis=0)
+
+        # Train/Val split（僅從 train 切；不動到 test）
+        n_train = len(X_train)
+        idx = np.arange(n_train); np.random.shuffle(idx)
+        split = int(n_train * (1.0 - args.val_ratio))
+        tr_idx, va_idx = idx[:split], idx[split:]
+
+        if args.model == "tcn":
+            tr_ds = SeqDataset(X_train[tr_idx], y_train[tr_idx], win_instancenorm=args.win_instancenorm)
+            va_ds = SeqDataset(X_train[va_idx], y_train[va_idx], win_instancenorm=args.win_instancenorm)
+            te_ds = SeqDataset(X_test,          y_test,           win_instancenorm=args.win_instancenorm)
+
+            tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0)
+            va_loader = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+            te_loader = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+
+            n_channels = X_train.shape[1]  # 自動讀通道數（6 或 7）
+            model = TCNRegressor(
+                n_channels=n_channels, hidden=args.hidden, levels=args.levels,
+                kernel_size=args.kernel, dropout=args.dropout
+            ).to(device)
+
+            optim = torch.optim.Adam(model.parameters(), lr=args.lr)
+            best_va = float("inf"); best_state = None; patience, bad = args.patience, 0
+            for ep in range(1, args.epochs + 1):
+                tr_loss = train_one(model, tr_loader, optim, device)
+                r2_va, mae_va, rmse_va = eval_one(model, va_loader, device)
+                if rmse_va < best_va:
+                    best_va = rmse_va
+                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                    bad = 0
+                else:
+                    bad += 1
+                print(f"[FIXED][TCN] Epoch {ep:03d} | train MSE:{tr_loss:.4f} | val R2:{r2_va:.3f} MAE:{mae_va:.2f} RMSE:{rmse_va:.2f}")
+                if bad >= patience:
+                    print("[FIXED][TCN] Early stopping."); break
+
+            if best_state is not None:
+                model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+            r2_te, mae_te, rmse_te = eval_one(model, te_loader, device)
+            print(f"\n[TEST][TCN] R2={r2_te:.3f} | MAE={mae_te:.2f} | RMSE={rmse_te:.2f}")
+        else:
+            # sklearn 路徑：可選擇是否做 window instance norm，然後展平
+            X_train_np = X_train.copy()
+            X_test_np = X_test.copy()
+            if args.win_instancenorm:
+                X_train_np = apply_window_instance_norm_numpy(X_train_np)
+                X_test_np = apply_window_instance_norm_numpy(X_test_np)
+            Xtr = flatten_windows(X_train_np[tr_idx])
+            ytr = y_train[tr_idx]
+            Xva = flatten_windows(X_train_np[va_idx])
+            yva = y_train[va_idx]
+            Xte = flatten_windows(X_test_np)
+            yte = y_test
+
+            if args.model == "rf":
+                model = RandomForestRegressor(n_estimators=args.rf_estimators,
+                                              max_depth=args.rf_max_depth,
+                                              n_jobs=-1,
+                                              random_state=args.seed)
+            elif args.model == "svr":
+                gamma_val = args.svr_gamma
+                try:
+                    # 支援數值 gamma
+                    gamma_val = float(args.svr_gamma)
+                except Exception:
+                    pass
+                model = SVR(kernel=args.svr_kernel, C=args.svr_C, gamma=gamma_val)
+            else:
+                raise ValueError("Unknown sklearn model")
+
+            model.fit(Xtr, ytr)
+            y_pred_va = model.predict(Xva)
+            rmse_va = math.sqrt(((y_pred_va - yva) ** 2).mean())
+            mae_va = np.abs(y_pred_va - yva).mean()
+            r2_va = r2_score(yva, y_pred_va)
+            print(f"[FIXED][{args.model.upper()}] val R2:{r2_va:.3f} MAE:{mae_va:.2f} RMSE:{rmse_va:.2f}")
+
+            y_pred_te = model.predict(Xte)
+            rmse_te = math.sqrt(((y_pred_te - yte) ** 2).mean())
+            mae_te = np.abs(y_pred_te - yte).mean()
+            r2_te = r2_score(yte, y_pred_te)
+            print(f"\n[TEST][{args.model.upper()}] R2={r2_te:.3f} | MAE={mae_te:.2f} | RMSE={rmse_te:.2f}")
+
+        # 可選：輸出預測 CSV（如需）
+        # y_pred = []
+        # for xb, _ in te_loader:
+        #     xb = xb.to(device)
+        #     with torch.no_grad():
+        #         y_pred.append(model(xb).cpu().numpy())
+        # y_pred = np.concatenate(y_pred)
+        # pd.DataFrame({'y_true': y_test, 'y_pred': y_pred}).to_csv("fixed_test_predictions.csv", index=False)
+
+        return  # fixed 模式結束
+
+    # --------- LOSO（維持你原本流程，僅小調整） ---------
+    if not args.csv:
+        raise ValueError("When --mode loso, please provide --csv.")
+    df = pd.read_csv(args.csv)
     if not expected_cols.issubset(set(df.columns)):
         raise ValueError(f"CSV must contain columns: {expected_cols}")
 
-    # Prepare windows per subject
     subj_data = prepare_subject_windows(
         df, fps=args.fps, seq_sec=args.seq_sec, stride_sec=args.stride_sec,
         zscore_within_subject=(not args.no_zscore),
         use_pos=args.use_pos, pos_win=args.pos_win
     )
     subjects = list(subj_data.keys())
-    print(f"Training Device: {args.device}")
     print(f"[Info] Subjects with enough data: {len(subjects)} -> {subjects[:5]}{'...' if len(subjects)>5 else ''}")
 
-    # LOSO
-    device = torch.device(args.device)
     all_rows = []
     for test_subj in subjects:
         X_train_np, y_train_np = concat_except(subj_data, exclude_key=test_subj)
-        X_test_np, y_test_np = subj_data[test_subj]
-
+        X_test_np,  y_test_np  = subj_data[test_subj]
         if len(X_test_np) == 0 or len(X_train_np) == 0:
             continue
 
-        # Train/Val split (random over windows from training subjects)
         n_train = len(X_train_np)
-        idx = np.arange(n_train)
-        np.random.shuffle(idx)
+        idx = np.arange(n_train); np.random.shuffle(idx)
         split = int(n_train * (1.0 - args.val_ratio))
         tr_idx, va_idx = idx[:split], idx[split:]
 
-        Xtr = torch.from_numpy(X_train_np[tr_idx])  # (N,6,T)
-        ytr = torch.from_numpy(y_train_np[tr_idx])
-        Xva = torch.from_numpy(X_train_np[va_idx])
-        yva = torch.from_numpy(y_train_np[va_idx])
-        Xte = torch.from_numpy(X_test_np)
-        yte = torch.from_numpy(y_test_np)
+        if args.model == "tcn":
+            tr_ds = SeqDataset(X_train_np[tr_idx], y_train_np[tr_idx], win_instancenorm=args.win_instancenorm)
+            va_ds = SeqDataset(X_train_np[va_idx], y_train_np[va_idx], win_instancenorm=args.win_instancenorm)
+            te_ds = SeqDataset(X_test_np,        y_test_np,        win_instancenorm=args.win_instancenorm)
 
-        tr_ds = SeqDataset(Xtr.numpy(), ytr.numpy(), win_instancenorm=args.win_instancenorm)
-        va_ds = SeqDataset(Xva.numpy(), yva.numpy(), win_instancenorm=args.win_instancenorm)
-        te_ds = SeqDataset(Xte.numpy(), yte.numpy(), win_instancenorm=args.win_instancenorm)
+            tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0)
+            va_loader = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+            te_loader = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
+            n_channels = X_train_np.shape[1]
+            model = TCNRegressor(
+                n_channels=n_channels, hidden=args.hidden, levels=args.levels,
+                kernel_size=args.kernel, dropout=args.dropout
+            ).to(device)
 
-        tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
-        va_loader = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
-        te_loader = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+            optim = torch.optim.Adam(model.parameters(), lr=args.lr)
+            best_va = float("inf"); best_state = None; patience, bad = 10, 0
+            for ep in range(1, args.epochs + 1):
+                tr_loss = train_one(model, tr_loader, optim, device)
+                r2_va, mae_va, rmse_va = eval_one(model, va_loader, device)
+                if rmse_va < best_va:
+                    best_va = rmse_va
+                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                    bad = 0
+                else:
+                    bad += 1
+                print(f"[{test_subj}][TCN] Epoch {ep:03d} | train MSE:{tr_loss:.4f} | val R2:{r2_va:.3f} MAE:{mae_va:.2f} RMSE:{rmse_va:.2f}")
+                if bad >= patience:
+                    print(f"[{test_subj}][TCN] Early stopping."); break
 
-        model = TCNRegressor(
-            n_channels=7 if args.use_pos else 6, hidden=args.hidden, levels=args.levels,
-            kernel_size=args.kernel, dropout=args.dropout
-        ).to(device)
+            if best_state is not None:
+                model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+            r2_te, mae_te, rmse_te = eval_one(model, te_loader, device)
+            row = {"test_subject": test_subj, "n_test_windows": len(X_test_np),
+                   "R2": float(r2_te), "MAE": float(mae_te), "RMSE": float(rmse_te)}
+            all_rows.append(row)
+            print(f"[TEST {test_subj}][TCN] R2={row['R2']:.3f} | MAE={row['MAE']:.2f} | RMSE={row['RMSE']:.2f}")
+        else:
+            Xtr_full = X_train_np.copy()
+            Xte_full = X_test_np.copy()
+            if args.win_instancenorm:
+                Xtr_full = apply_window_instance_norm_numpy(Xtr_full)
+                Xte_full = apply_window_instance_norm_numpy(Xte_full)
+            Xtr = flatten_windows(Xtr_full[tr_idx])
+            ytr = y_train_np[tr_idx]
+            Xva = flatten_windows(Xtr_full[va_idx])
+            yva = y_train_np[va_idx]
+            Xte = flatten_windows(Xte_full)
+            yte = y_test_np
 
-        optim = torch.optim.Adam(model.parameters(), lr=args.lr)
-        best_va = float("inf")
-        best_state = None
-        patience, bad = 10, 0  # early stopping
-
-        for ep in range(1, args.epochs + 1):
-            tr_loss = train_one(model, tr_loader, optim, device)
-            r2_va, mae_va, rmse_va = eval_one(model, va_loader, device)
-            if rmse_va < best_va:
-                best_va = rmse_va
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                bad = 0
+            if args.model == "rf":
+                model = RandomForestRegressor(n_estimators=args.rf_estimators,
+                                              max_depth=args.rf_max_depth,
+                                              n_jobs=-1,
+                                              random_state=args.seed)
+            elif args.model == "svr":
+                gamma_val = args.svr_gamma
+                try:
+                    gamma_val = float(args.svr_gamma)
+                except Exception:
+                    pass
+                model = SVR(kernel=args.svr_kernel, C=args.svr_C, gamma=gamma_val)
             else:
-                bad += 1
-            print(f"[{test_subj}] Epoch {ep:03d} | train MSE:{tr_loss:.4f} | val R2:{r2_va:.3f} MAE:{mae_va:.2f} RMSE:{rmse_va:.2f}")
-            if bad >= patience:
-                print(f"[{test_subj}] Early stopping.")
-                break
+                raise ValueError("Unknown sklearn model")
 
-        if best_state is not None:
-            model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
-        r2_te, mae_te, rmse_te = eval_one(model, te_loader, device)
+            model.fit(Xtr, ytr)
+            y_pred_va = model.predict(Xva)
+            rmse_va = math.sqrt(((y_pred_va - yva) ** 2).mean())
+            mae_va = np.abs(y_pred_va - yva).mean()
+            r2_va = r2_score(yva, y_pred_va)
+            print(f"[{test_subj}][{args.model.upper()}] val R2:{r2_va:.3f} MAE:{mae_va:.2f} RMSE:{rmse_va:.2f}")
 
-        row = {
-            "test_subject": test_subj,
-            "n_test_windows": len(X_test_np),
-            "R2": float(r2_te),
-            "MAE": float(mae_te),
-            "RMSE": float(rmse_te),
-        }
-        all_rows.append(row)
-        print(f"[TEST {test_subj}] R2={row['R2']:.3f} | MAE={row['MAE']:.2f} | RMSE={row['RMSE']:.2f}")
+            y_pred_te = model.predict(Xte)
+            rmse_te = math.sqrt(((y_pred_te - yte) ** 2).mean())
+            mae_te = np.abs(y_pred_te - yte).mean()
+            r2_te = r2_score(yte, y_pred_te)
+            row = {"test_subject": test_subj, "n_test_windows": len(X_test_np),
+                   "R2": float(r2_te), "MAE": float(mae_te), "RMSE": float(rmse_te)}
+            all_rows.append(row)
+            print(f"[TEST {test_subj}][{args.model.upper()}] R2={row['R2']:.3f} | MAE={row['MAE']:.2f} | RMSE={row['RMSE']:.2f}")
 
     if len(all_rows):
         out = pd.DataFrame(all_rows).sort_values("R2", ascending=False)
