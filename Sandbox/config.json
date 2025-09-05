@@ -1,0 +1,29 @@
+{
+  "mode": "fixed",
+  "model": "tcn",
+  "train_csv": [
+    "prc-c920.csv",
+    "prc-i15.csv",
+    "prc-i15m.csv",
+    "prc-s9160.csv",
+    "prc-s9180.csv"
+  ],
+  "test_csv": [
+    "prc-c920.csv",
+    "prc-i15.csv",
+    "prc-i15m.csv",
+    "prc-s9160.csv",
+    "prc-s9180.csv",
+    "hm1-c930.csv",
+    "hm2-c930.csv",
+    "hm1-i15.csv",
+    "hm2-i15.csv",
+    "hm1-i15m.csv",
+    "hm2-i15m.csv",
+    "hm1-s9260.csv",
+    "hm1-s9280.csv"
+  ],
+  "subject_normalization": false,
+  "segment_normalization": true,
+  "use_pos": true
+}

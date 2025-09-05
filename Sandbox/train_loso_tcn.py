@@ -101,15 +101,26 @@ def build_windows(
     y = np.array(ys, dtype=np.float32)
     return X, y
 
-def apply_window_instance_norm_numpy(X: np.ndarray) -> np.ndarray:
+def apply_segment_norm_numpy(X: np.ndarray) -> np.ndarray:
     """
     對 numpy 格式的 (N, C, T) 做每個樣本、每通道的 instance normalization。
+    只對前六個特徵進行標準化，第七個特徵（POS）保持不變。
     """
     if X.size == 0:
         return X
-    mu = X.mean(axis=2, keepdims=True)
-    std = X.std(axis=2, keepdims=True) + 1e-8
-    return (X - mu) / std
+    
+    # 複製原始數據
+    X_norm = X.copy()
+    
+    # 只對前六個通道進行標準化
+    channels_to_norm = min(6, X.shape[1])  # 確保不超過實際通道數
+    
+    if channels_to_norm > 0:
+        mu = X[:, :channels_to_norm, :].mean(axis=2, keepdims=True)
+        std = X[:, :channels_to_norm, :].std(axis=2, keepdims=True) + 1e-8
+        X_norm[:, :channels_to_norm, :] = (X[:, :channels_to_norm, :] - mu) / std
+    
+    return X_norm
 
 def flatten_windows(X: np.ndarray) -> np.ndarray:
     """(N, C, T) -> (N, C*T) 用於 sklearn 模型。"""
@@ -122,25 +133,27 @@ def flatten_windows(X: np.ndarray) -> np.ndarray:
 # Dataset
 # -----------------------------
 class SeqDataset(Dataset):
-    def __init__(self, X: np.ndarray, y: np.ndarray, win_instancenorm: bool = False):
+    def __init__(self, X: np.ndarray, y: np.ndarray, segment_normalization: bool = False):
         """
         X: (N, C, T), y: (N,)
-        win_instancenorm=True 時，對每個樣本做 (x - mean_c)/std_c，按通道 c 各自計算。
+        segment_normalization=True 時，對每個樣本做 (x - mean_c)/std_c，按通道 c 各自計算。
         """
         self.X = torch.from_numpy(X)        # 直接先轉 tensor，提高效率
         self.y = torch.from_numpy(y)
-        self.win_instancenorm = win_instancenorm
+        self.segment_normalization = segment_normalization
 
     def __len__(self): 
         return self.X.shape[0]
 
     def __getitem__(self, idx):
-        x = self.X[idx]    # shape: (C, T) - torch.float32
-        if self.win_instancenorm:
-            # 每個通道各自做零均值、單位變異，避免分母為 0
-            mu = x.mean(dim=-1, keepdim=True)                 # (C, 1)
-            std = x.std(dim=-1, keepdim=True).clamp_min(1e-8) # (C, 1)
-            x = (x - mu) / std
+        x = self.X[idx]
+        if self.segment_normalization:
+            x = x.clone()  # ★ 先複製，避免動到底層儲存
+            channels_to_norm = min(6, x.shape[0])
+            if channels_to_norm > 0:
+                mu  = x[:channels_to_norm].mean(dim=-1, keepdim=True)
+                std = x[:channels_to_norm].std(dim=-1, keepdim=True).clamp_min(1e-8)
+                x[:channels_to_norm] = (x[:channels_to_norm] - mu) / std
         return x, self.y[idx]
 
 # -----------------------------
@@ -283,7 +296,7 @@ def prepare_subject_windows(
         six_list = getsixchannels(rgb)
         ch6 = np.stack(six_list, axis=0).astype(np.float32)  # (6, N)
 
-        # 受試者內 z-score（建議保留；若你要關閉可用 --no_zscore）
+        # 受試者內 z-score
         if zscore_within_subject:
             mu = ch6.mean(axis=1, keepdims=True)
             std = ch6.std(axis=1, keepdims=True) + 1e-8
@@ -294,11 +307,8 @@ def prepare_subject_windows(
             ok, pos = getPOS(R.copy(), G.copy(), B.copy(), win_len=pos_win)
             if ok and pos.size == N:
                 pos_ch = pos.reshape(1, -1).astype(np.float32)  # (1, N)
-                # POS 也做受試者內 z-score，讓尺度對齊
-                if zscore_within_subject:
-                    p_mu = pos_ch.mean(axis=1, keepdims=True)
-                    p_std = pos_ch.std(axis=1, keepdims=True) + 1e-8
-                    pos_ch = (pos_ch - p_mu) / p_std
+                p_mu = pos_ch.mean(axis=1, keepdims=True)
+                pos_ch = pos_ch - p_mu
                 X_all = np.concatenate([ch6, pos_ch], axis=0)  # (7, N)
             else:
                 # 失敗就只用 6 通道
@@ -324,6 +334,155 @@ def concat_except(subject_dict: Dict[str, Tuple[np.ndarray, np.ndarray]], exclud
     return np.concatenate(Xs, axis=0), np.concatenate(ys, axis=0)
 
 # -----------------------------
+# Fixed-mode utilities
+# -----------------------------
+def train_model_once(train_path: str, args, device) -> Tuple[any, Dict[str, any]]:
+    """訓練一次模型，返回模型和訓練資料資訊"""
+    expected_cols = {"Folder","COLOR_R","COLOR_G","COLOR_B","SPO2"}
+    df_tr = pd.read_csv(train_path)
+    if not expected_cols.issubset(df_tr.columns):
+        raise ValueError(f"CSV must contain columns: {expected_cols}")
+
+    subj_tr = prepare_subject_windows(
+        df_tr, fps=args.fps, seq_sec=args.seq_sec, stride_sec=args.stride_sec,
+        zscore_within_subject=args.subject_normalization,
+        use_pos=args.use_pos, pos_win=args.pos_win
+    )
+
+    if len(subj_tr) == 0:
+        raise ValueError("No train subjects produced windows. Check seq_sec/stride_sec.")
+    X_train = np.concatenate([v[0] for v in subj_tr.values()], axis=0)
+    y_train = np.concatenate([v[1] for v in subj_tr.values()], axis=0)
+
+    n_train = len(X_train)
+    idx = np.arange(n_train); np.random.shuffle(idx)
+    split = int(n_train * (1.0 - args.val_ratio))
+    tr_idx, va_idx = idx[:split], idx[split:]
+
+    train_info = {
+        "X_train": X_train,
+        "y_train": y_train,
+        "tr_idx": tr_idx,
+        "va_idx": va_idx,
+        "n_channels": X_train.shape[1]
+    }
+
+    if args.model == "tcn":
+        tr_ds = SeqDataset(X_train[tr_idx], y_train[tr_idx], segment_normalization=args.segment_normalization)
+        va_ds = SeqDataset(X_train[va_idx], y_train[va_idx], segment_normalization=args.segment_normalization)
+
+        tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0)
+        va_loader = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+
+        model = TCNRegressor(
+            n_channels=train_info["n_channels"], hidden=args.hidden, levels=args.levels,
+            kernel_size=args.kernel, dropout=args.dropout
+        ).to(device)
+
+        optim = torch.optim.Adam(model.parameters(), lr=args.lr)
+        best_va = float("inf"); best_state = None; patience, bad = args.patience, 0
+        for ep in range(1, args.epochs + 1):
+            tr_loss = train_one(model, tr_loader, optim, device)
+            r2_va, mae_va, rmse_va = eval_one(model, va_loader, device)
+            if rmse_va < best_va:
+                best_va = rmse_va
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                bad = 0
+            else:
+                bad += 1
+            print(f"[TRAIN][TCN][{os.path.basename(train_path)}] "
+                  f"Epoch {ep:03d} | train MSE:{tr_loss:.4f} | val R2:{r2_va:.3f} MAE:{mae_va:.2f} RMSE:{rmse_va:.2f}")
+            if bad >= patience:
+                print("[TRAIN][TCN] Early stopping."); break
+
+        if best_state is not None:
+            model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+        
+        return model, train_info
+    else:
+        # sklearn 模型
+        X_train_np = X_train.copy()
+        if args.segment_normalization:
+            X_train_np = apply_segment_norm_numpy(X_train_np)
+        Xtr = flatten_windows(X_train_np[tr_idx])
+        ytr = y_train[tr_idx]
+        Xva = flatten_windows(X_train_np[va_idx])
+        yva = y_train[va_idx]
+
+        if args.model == "rf":
+            model = RandomForestRegressor(n_estimators=args.rf_estimators,
+                                          max_depth=args.rf_max_depth,
+                                          n_jobs=-1,
+                                          random_state=args.seed)
+        elif args.model == "svr":
+            gamma_val = args.svr_gamma
+            try:
+                gamma_val = float(args.svr_gamma)
+            except Exception:
+                pass
+            model = SVR(kernel=args.svr_kernel, C=args.svr_C, gamma=gamma_val)
+        else:
+            raise ValueError("Unknown sklearn model")
+
+        model.fit(Xtr, ytr)
+        y_pred_va = model.predict(Xva)
+        rmse_va = math.sqrt(((y_pred_va - yva) ** 2).mean())
+        mae_va = np.abs(y_pred_va - yva).mean()
+        r2_va = r2_score(yva, y_pred_va)
+        print(f"[TRAIN][{args.model.upper()}][{os.path.basename(train_path)}] "
+              f"val R2:{r2_va:.3f} MAE:{mae_va:.2f} RMSE:{rmse_va:.2f}")
+        
+        return model, train_info
+
+def evaluate_test_with_trained_model(model, train_info: Dict[str, any], test_path: str, args, device) -> Dict[str, float]:
+    """使用已訓練的模型評估測試集"""
+    expected_cols = {"Folder","COLOR_R","COLOR_G","COLOR_B","SPO2"}
+    df_te = pd.read_csv(test_path)
+    if not expected_cols.issubset(df_te.columns):
+        raise ValueError(f"CSV must contain columns: {expected_cols}")
+
+    subj_te = prepare_subject_windows(
+        df_te, fps=args.fps, seq_sec=args.seq_sec, stride_sec=args.stride_sec,
+        zscore_within_subject=args.subject_normalization,
+        use_pos=args.use_pos, pos_win=args.pos_win
+    )
+
+    if len(subj_te) == 0:
+        raise ValueError("No test subjects produced windows. Check seq_sec/stride_sec.")
+    X_test = np.concatenate([v[0] for v in subj_te.values()], axis=0)
+    y_test = np.concatenate([v[1] for v in subj_te.values()], axis=0)
+
+    result_row = {
+        "test_csv": os.path.basename(test_path),
+        "model": args.model,
+    }
+
+    if args.model == "tcn":
+        te_ds = SeqDataset(X_test, y_test, segment_normalization=args.segment_normalization)
+        te_loader = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+        
+        r2_te, mae_te, rmse_te = eval_one(model, te_loader, device)
+        print(f"[TEST][TCN][{os.path.basename(test_path)}] "
+              f"R2={r2_te:.3f} | MAE={mae_te:.2f} | RMSE={rmse_te:.2f}")
+        result_row.update({"R2": float(r2_te), "MAE": float(mae_te)})
+        return result_row
+    else:
+        X_test_np = X_test.copy()
+        if args.segment_normalization:
+            X_test_np = apply_segment_norm_numpy(X_test_np)
+        Xte = flatten_windows(X_test_np)
+        yte = y_test
+
+        y_pred_te = model.predict(Xte)
+        rmse_te = math.sqrt(((y_pred_te - yte) ** 2).mean())
+        mae_te = np.abs(y_pred_te - yte).mean()
+        r2_te = r2_score(yte, y_pred_te)
+        print(f"[TEST][{args.model.upper()}][{os.path.basename(test_path)}] "
+              f"R2={r2_te:.3f} | MAE={mae_te:.2f} | RMSE={rmse_te:.2f}")
+        result_row.update({"R2": float(r2_te), "MAE": float(mae_te)})
+        return result_row
+
+# -----------------------------
 # Main
 # -----------------------------
 def main():
@@ -344,8 +503,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--val_ratio", type=float, default=0.1, help="val split from training subjects' windows")
-    parser.add_argument("--no_zscore", action="store_true", help="disable per-subject z-score normalization")
-    parser.add_argument("--win_instancenorm", action="store_true",
+    parser.add_argument("--subject_normalization", action="store_true", help="enable per-subject z-score normalization")
+    parser.add_argument("--segment_normalization", action="store_true",
                         help="Apply per-window, per-channel instance normalization on inputs.")
     parser.add_argument("--use_pos", action="store_true",
                         help="Append POS as an extra input channel (no HR prediction).")
@@ -363,10 +522,10 @@ def main():
     parser.add_argument("--mode", type=str, default="loso",
                         choices=["loso", "fixed"],
                         help="Evaluation mode: 'loso' (leave-one-subject-out) or 'fixed' (train/test CSV).")
-    parser.add_argument("--train_csv", type=str, default=None,
-                        help="Path to train_data.csv when --mode fixed")
-    parser.add_argument("--test_csv", type=str, default=None,
-                        help="Path to test_data.csv when --mode fixed")
+    parser.add_argument("--train_csv", nargs='+', type=str, default=None,
+                        help="One or more train CSV paths when --mode fixed")
+    parser.add_argument("--test_csv", nargs='+', type=str, default=None,
+                        help="One or more test CSV paths when --mode fixed")
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -377,127 +536,109 @@ def main():
     expected_cols = {"Folder","COLOR_R","COLOR_G","COLOR_B","SPO2"}
 
     if args.mode == "fixed":
-        # --------- FIXED: 讀 train/test 兩檔 ---------
+        # --------- FIXED: 優化版本 - 相同訓練集只訓練一次 ---------
         if not args.train_csv or not args.test_csv:
             raise ValueError("When --mode fixed, please provide --train_csv and --test_csv.")
-        df_tr = pd.read_csv(args.train_csv)
-        df_te = pd.read_csv(args.test_csv)
-        if not expected_cols.issubset(df_tr.columns) or not expected_cols.issubset(df_te.columns):
-            raise ValueError(f"CSV must contain columns: {expected_cols}")
 
-        # 各自資料內建視窗（重要：train/test 各自做受試者內 z-score，避免洩漏）
-        subj_tr = prepare_subject_windows(
-            df_tr, fps=args.fps, seq_sec=args.seq_sec, stride_sec=args.stride_sec,
-            zscore_within_subject=(not args.no_zscore),
-            use_pos=args.use_pos, pos_win=args.pos_win
-        )
-        subj_te = prepare_subject_windows(
-            df_te, fps=args.fps, seq_sec=args.seq_sec, stride_sec=args.stride_sec,
-            zscore_within_subject=(not args.no_zscore),
-            use_pos=args.use_pos, pos_win=args.pos_win
-        )
+        # argparse 使用 nargs='+' 時會是 list；保險處理單一路徑字串
+        train_list = args.train_csv if isinstance(args.train_csv, list) else [args.train_csv]
+        test_list  = args.test_csv  if isinstance(args.test_csv, list)  else [args.test_csv]
 
-        # 合併所有 subject 成單一訓練/測試集合
-        if len(subj_tr) == 0 or len(subj_te) == 0:
-            raise ValueError("No train/test subjects produced windows. Check seq_sec/stride_sec.")
-        X_train = np.concatenate([v[0] for v in subj_tr.values()], axis=0)
-        y_train = np.concatenate([v[1] for v in subj_tr.values()], axis=0)
-        X_test  = np.concatenate([v[0] for v in subj_te.values()], axis=0)
-        y_test  = np.concatenate([v[1] for v in subj_te.values()], axis=0)
-
-        # Train/Val split（僅從 train 切；不動到 test）
-        n_train = len(X_train)
-        idx = np.arange(n_train); np.random.shuffle(idx)
-        split = int(n_train * (1.0 - args.val_ratio))
-        tr_idx, va_idx = idx[:split], idx[split:]
-
-        if args.model == "tcn":
-            tr_ds = SeqDataset(X_train[tr_idx], y_train[tr_idx], win_instancenorm=args.win_instancenorm)
-            va_ds = SeqDataset(X_train[va_idx], y_train[va_idx], win_instancenorm=args.win_instancenorm)
-            te_ds = SeqDataset(X_test,          y_test,           win_instancenorm=args.win_instancenorm)
-
-            tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0)
-            va_loader = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
-            te_loader = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
-
-            n_channels = X_train.shape[1]  # 自動讀通道數（6 或 7）
-            model = TCNRegressor(
-                n_channels=n_channels, hidden=args.hidden, levels=args.levels,
-                kernel_size=args.kernel, dropout=args.dropout
-            ).to(device)
-
-            optim = torch.optim.Adam(model.parameters(), lr=args.lr)
-            best_va = float("inf"); best_state = None; patience, bad = args.patience, 0
-            for ep in range(1, args.epochs + 1):
-                tr_loss = train_one(model, tr_loader, optim, device)
-                r2_va, mae_va, rmse_va = eval_one(model, va_loader, device)
-                if rmse_va < best_va:
-                    best_va = rmse_va
-                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                    bad = 0
-                else:
-                    bad += 1
-                print(f"[FIXED][TCN] Epoch {ep:03d} | train MSE:{tr_loss:.4f} | val R2:{r2_va:.3f} MAE:{mae_va:.2f} RMSE:{rmse_va:.2f}")
-                if bad >= patience:
-                    print("[FIXED][TCN] Early stopping."); break
-
-            if best_state is not None:
-                model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
-            r2_te, mae_te, rmse_te = eval_one(model, te_loader, device)
-            print(f"\n[TEST][TCN] R2={r2_te:.3f} | MAE={mae_te:.2f} | RMSE={rmse_te:.2f}")
-        else:
-            # sklearn 路徑：可選擇是否做 window instance norm，然後展平
-            X_train_np = X_train.copy()
-            X_test_np = X_test.copy()
-            if args.win_instancenorm:
-                X_train_np = apply_window_instance_norm_numpy(X_train_np)
-                X_test_np = apply_window_instance_norm_numpy(X_test_np)
-            Xtr = flatten_windows(X_train_np[tr_idx])
-            ytr = y_train[tr_idx]
-            Xva = flatten_windows(X_train_np[va_idx])
-            yva = y_train[va_idx]
-            Xte = flatten_windows(X_test_np)
-            yte = y_test
-
-            if args.model == "rf":
-                model = RandomForestRegressor(n_estimators=args.rf_estimators,
-                                              max_depth=args.rf_max_depth,
-                                              n_jobs=-1,
-                                              random_state=args.seed)
-            elif args.model == "svr":
-                gamma_val = args.svr_gamma
-                try:
-                    # 支援數值 gamma
-                    gamma_val = float(args.svr_gamma)
-                except Exception:
-                    pass
-                model = SVR(kernel=args.svr_kernel, C=args.svr_C, gamma=gamma_val)
+        combo_rows = []
+        trained_models = {}  # 快取已訓練的模型
+        
+        for tr_path in train_list:
+            if tr_path not in trained_models:
+                print(f"\n[TRAINING] {os.path.basename(tr_path)}")
+                model, train_info = train_model_once(tr_path, args, device)
+                trained_models[tr_path] = (model, train_info)
             else:
-                raise ValueError("Unknown sklearn model")
+                print(f"\n[REUSING] {os.path.basename(tr_path)}")
+                model, train_info = trained_models[tr_path]
+            
+            for te_path in test_list:
+                # 跳過相同的訓練和測試檔案（避免資料洩漏）
+                if tr_path == te_path:
+                    print(f"[SKIP] {os.path.basename(tr_path)} -> {os.path.basename(te_path)} (相同檔案，跳過)")
+                    continue
+                
+                print(f"[TESTING] {os.path.basename(tr_path)} -> {os.path.basename(te_path)}")
+                row = evaluate_test_with_trained_model(model, train_info, te_path, args, device)
+                row["train_csv"] = os.path.basename(tr_path)  # 補上訓練檔案名稱
+                combo_rows.append(row)
 
-            model.fit(Xtr, ytr)
-            y_pred_va = model.predict(Xva)
-            rmse_va = math.sqrt(((y_pred_va - yva) ** 2).mean())
-            mae_va = np.abs(y_pred_va - yva).mean()
-            r2_va = r2_score(yva, y_pred_va)
-            print(f"[FIXED][{args.model.upper()}] val R2:{r2_va:.3f} MAE:{mae_va:.2f} RMSE:{rmse_va:.2f}")
-
-            y_pred_te = model.predict(Xte)
-            rmse_te = math.sqrt(((y_pred_te - yte) ** 2).mean())
-            mae_te = np.abs(y_pred_te - yte).mean()
-            r2_te = r2_score(yte, y_pred_te)
-            print(f"\n[TEST][{args.model.upper()}] R2={r2_te:.3f} | MAE={mae_te:.2f} | RMSE={rmse_te:.2f}")
-
-        # 可選：輸出預測 CSV（如需）
-        # y_pred = []
-        # for xb, _ in te_loader:
-        #     xb = xb.to(device)
-        #     with torch.no_grad():
-        #         y_pred.append(model(xb).cpu().numpy())
-        # y_pred = np.concatenate(y_pred)
-        # pd.DataFrame({'y_true': y_test, 'y_pred': y_pred}).to_csv("fixed_test_predictions.csv", index=False)
-
-        return  # fixed 模式結束
+        if len(combo_rows):
+            df = pd.DataFrame(combo_rows)
+            
+            # 分別產出 R2 和 MAE 的 CSV
+            r2_pivot = df.pivot(index='train_csv', columns='test_csv', values='R2')
+            mae_pivot = df.pivot(index='train_csv', columns='test_csv', values='MAE')
+            
+            # 重置 index 名稱
+            r2_pivot.index.name = 'train_file'
+            mae_pivot.index.name = 'train_file'
+            
+            # 儲存 CSV 檔案
+            r2_pivot.to_csv("fixed_combo_results_R2.csv")
+            mae_pivot.to_csv("fixed_combo_results_MAE.csv")
+            
+            print(f"\nSaved: fixed_combo_results_R2.csv")
+            print(f"Saved: fixed_combo_results_MAE.csv")
+            
+            # 生成熱圖
+            try:
+                import matplotlib.pyplot as plt
+                import seaborn as sns
+                
+                # 設定中文字體
+                plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+                plt.rcParams['axes.unicode_minus'] = False
+                
+                # 處理欄位名稱：移除 .csv 後綴
+                r2_pivot_clean = r2_pivot.copy()
+                mae_pivot_clean = mae_pivot.copy()
+                
+                # 移除 columns 的 .csv 後綴
+                r2_pivot_clean.columns = [col.replace('.csv', '') for col in r2_pivot_clean.columns]
+                mae_pivot_clean.columns = [col.replace('.csv', '') for col in mae_pivot_clean.columns]
+                
+                # 移除 index 的 .csv 後綴
+                r2_pivot_clean.index = [idx.replace('.csv', '') for idx in r2_pivot_clean.index]
+                mae_pivot_clean.index = [idx.replace('.csv', '') for idx in mae_pivot_clean.index]
+                
+                # 創建子圖
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+                
+                # R2 熱圖
+                sns.heatmap(r2_pivot_clean, annot=True, fmt='.2f', cmap='RdYlGn', 
+                           center=0.0, ax=ax1, cbar_kws={'label': 'R2 Score'},
+                           annot_kws={'fontsize': 8})
+                ax1.set_title('R2 Score Heatmap')
+                ax1.set_xlabel('Test')
+                ax1.set_ylabel('Train')
+                # 旋轉 x 軸標籤 45 度
+                ax1.set_xticklabels(ax1.get_xticklabels(), rotation=45, ha='right')
+                ax1.set_yticklabels(ax1.get_yticklabels(), rotation=0)
+                
+                # MAE 熱圖 - 修復顯示問題
+                sns.heatmap(mae_pivot_clean, annot=True, fmt='.1f', cmap='RdYlGn_r', 
+                           center=10.0, ax=ax2, cbar_kws={'label': 'MAE'},
+                           annot_kws={'fontsize': 8})
+                ax2.set_title('MAE Heatmap')
+                ax2.set_xlabel('Test')
+                ax2.set_ylabel('Train')
+                # 旋轉 x 軸標籤 45 度
+                ax2.set_xticklabels(ax2.get_xticklabels(), rotation=45, ha='right')
+                ax2.set_yticklabels(ax2.get_yticklabels(), rotation=0)
+                
+                plt.tight_layout()
+                plt.savefig('fixed_combo_heatmap.png', dpi=300, bbox_inches='tight')
+                print(f"Saved: fixed_combo_heatmap.png")
+                
+            except ImportError:
+                print("注意：無法生成熱圖，請安裝 matplotlib 和 seaborn")
+                print("pip install matplotlib seaborn")
+        return
 
     # --------- LOSO（維持你原本流程，僅小調整） ---------
     if not args.csv:
@@ -508,7 +649,7 @@ def main():
 
     subj_data = prepare_subject_windows(
         df, fps=args.fps, seq_sec=args.seq_sec, stride_sec=args.stride_sec,
-        zscore_within_subject=(not args.no_zscore),
+        zscore_within_subject=args.subject_normalization,
         use_pos=args.use_pos, pos_win=args.pos_win
     )
     subjects = list(subj_data.keys())
@@ -527,9 +668,9 @@ def main():
         tr_idx, va_idx = idx[:split], idx[split:]
 
         if args.model == "tcn":
-            tr_ds = SeqDataset(X_train_np[tr_idx], y_train_np[tr_idx], win_instancenorm=args.win_instancenorm)
-            va_ds = SeqDataset(X_train_np[va_idx], y_train_np[va_idx], win_instancenorm=args.win_instancenorm)
-            te_ds = SeqDataset(X_test_np,        y_test_np,        win_instancenorm=args.win_instancenorm)
+            tr_ds = SeqDataset(X_train_np[tr_idx], y_train_np[tr_idx], segment_normalization=args.segment_normalization)
+            va_ds = SeqDataset(X_train_np[va_idx], y_train_np[va_idx], segment_normalization=args.segment_normalization)
+            te_ds = SeqDataset(X_test_np,        y_test_np,        segment_normalization=args.segment_normalization)
 
             tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0)
             va_loader = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
@@ -566,9 +707,9 @@ def main():
         else:
             Xtr_full = X_train_np.copy()
             Xte_full = X_test_np.copy()
-            if args.win_instancenorm:
-                Xtr_full = apply_window_instance_norm_numpy(Xtr_full)
-                Xte_full = apply_window_instance_norm_numpy(Xte_full)
+            if args.segment_normalization:
+                Xtr_full = apply_segment_norm_numpy(Xtr_full)
+                Xte_full = apply_segment_norm_numpy(Xte_full)
             Xtr = flatten_windows(Xtr_full[tr_idx])
             ytr = y_train_np[tr_idx]
             Xva = flatten_windows(Xtr_full[va_idx])
