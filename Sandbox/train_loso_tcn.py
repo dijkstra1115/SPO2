@@ -72,15 +72,6 @@ def getsixchannels(rgb: np.ndarray) -> List[np.ndarray]:
     chrom_x =   3*rgb[0, :] - 2*rgb[1, :]
     return [ycgcr_cg, ycgcr_cr, yiq_i, ydbdr_dr, pos_y, chrom_x]
 
-def per_subject_zscore(ch6: np.ndarray) -> np.ndarray:
-    """
-    ch6: (6, N) six-channel series for ONE subject.
-    z-score each channel within-subject to remove baseline/scale differences.
-    """
-    mu = ch6.mean(axis=1, keepdims=True)
-    std = ch6.std(axis=1, keepdims=True) + 1e-8
-    return (ch6 - mu) / std
-
 def build_windows(
     X_all: np.ndarray, spo2: np.ndarray, seq_len: int, stride: int
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -128,6 +119,53 @@ def flatten_windows(X: np.ndarray) -> np.ndarray:
         return X
     N, C, T = X.shape
     return X.reshape(N, C * T)
+
+def streaming_zscore_cumulative(ch6: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """
+    對 (C=6, N) 做「累積」z-score：
+    對每個通道 c，t 時刻用 [0..t] 的均值與標準差做標準化。
+    Welford 線上演算法，避免數值不穩。
+    """
+    C, N = ch6.shape
+    out = np.empty_like(ch6, dtype=np.float32)
+
+    for c in range(C):
+        mean = 0.0
+        M2 = 0.0
+        for t in range(N):
+            x = float(ch6[c, t])
+            # 更新統計量（t 計數從 1 開始）
+            n = t + 1
+            delta = x - mean
+            mean += delta / n
+            delta2 = x - mean
+            M2 += delta * delta2
+            var = M2 / max(1, n - 1)  # 無偏估計；n=1 時先給極小方差
+            std = math.sqrt(var) if var > 0 else 0.0
+            out[c, t] = (x - mean) / (std + eps)
+    return out
+
+def streaming_zscore_ema(ch6: np.ndarray, alpha: float = 0.05, eps: float = 1e-8) -> np.ndarray:
+    """
+    對 (C=6, N) 做 EMA z-score：
+    mu_t = α x_t + (1-α) mu_{t-1}
+    var_t 用 EMA 近似：v_t = α (x_t - mu_t)^2 + (1-α) v_{t-1}
+    """
+    C, N = ch6.shape
+    out = np.empty_like(ch6, dtype=np.float32)
+
+    for c in range(C):
+        mu = float(ch6[c, 0])
+        v  = 0.0
+        out[c, 0] = 0.0
+        for t in range(1, N):
+            x = float(ch6[c, t])
+            mu = alpha * x + (1.0 - alpha) * mu
+            diff = x - mu
+            v   = alpha * (diff * diff) + (1.0 - alpha) * v
+            std = math.sqrt(v)
+            out[c, t] = diff / (std + eps)
+    return out
 
 # -----------------------------
 # Dataset
@@ -271,7 +309,8 @@ def eval_one(model, loader, device):
 def prepare_subject_windows(
     df: pd.DataFrame, fps: int, seq_sec: int, stride_sec: int,
     zscore_within_subject: bool = True,
-    use_pos: bool = False, pos_win: int = 30
+    use_pos: bool = False, pos_win: int = 30,
+    args: argparse.Namespace = None
 ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
     """
     回傳: subject -> (X, y)
@@ -297,10 +336,17 @@ def prepare_subject_windows(
         ch6 = np.stack(six_list, axis=0).astype(np.float32)  # (6, N)
 
         # 受試者內 z-score
-        if zscore_within_subject:
+        if zscore_within_subject and args.online_norm == "none":
             mu = ch6.mean(axis=1, keepdims=True)
             std = ch6.std(axis=1, keepdims=True) + 1e-8
             ch6 = (ch6 - mu) / std
+
+        # ★ 新增：線上正規化（只處理前 6 通道）
+        if args.online_norm != "none":
+            if args.online_norm == "cumulative":
+                ch6 = streaming_zscore_cumulative(ch6)
+            elif args.online_norm == "ema":
+                ch6 = streaming_zscore_ema(ch6, alpha=args.ema_alpha)
 
         # 產生 POS 通道（可選）
         if use_pos:
@@ -346,7 +392,8 @@ def train_model_once(train_path: str, args, device) -> Tuple[any, Dict[str, any]
     subj_tr = prepare_subject_windows(
         df_tr, fps=args.fps, seq_sec=args.seq_sec, stride_sec=args.stride_sec,
         zscore_within_subject=args.subject_normalization,
-        use_pos=args.use_pos, pos_win=args.pos_win
+        use_pos=args.use_pos, pos_win=args.pos_win,
+        args=args
     )
 
     if len(subj_tr) == 0:
@@ -444,7 +491,8 @@ def evaluate_test_with_trained_model(model, train_info: Dict[str, any], test_pat
     subj_te = prepare_subject_windows(
         df_te, fps=args.fps, seq_sec=args.seq_sec, stride_sec=args.stride_sec,
         zscore_within_subject=args.subject_normalization,
-        use_pos=args.use_pos, pos_win=args.pos_win
+        use_pos=args.use_pos, pos_win=args.pos_win,
+        args=args
     )
 
     if len(subj_te) == 0:
@@ -506,6 +554,11 @@ def main():
     parser.add_argument("--subject_normalization", action="store_true", help="enable per-subject z-score normalization")
     parser.add_argument("--segment_normalization", action="store_true",
                         help="Apply per-window, per-channel instance normalization on inputs.")
+    parser.add_argument("--online_norm", type=str, default="none",
+                        choices=["none", "cumulative", "ema"],
+                        help="即時正規化模式：none | cumulative(累積) | ema(指數)")
+    parser.add_argument("--ema_alpha", type=float, default=0.05,
+                        help="EMA 模式下的 α，越大越快追隨變化 (0<α≤1)")
     parser.add_argument("--use_pos", action="store_true",
                         help="Append POS as an extra input channel (no HR prediction).")
     parser.add_argument("--pos_win", type=int, default=30,
@@ -650,7 +703,8 @@ def main():
     subj_data = prepare_subject_windows(
         df, fps=args.fps, seq_sec=args.seq_sec, stride_sec=args.stride_sec,
         zscore_within_subject=args.subject_normalization,
-        use_pos=args.use_pos, pos_win=args.pos_win
+        use_pos=args.use_pos, pos_win=args.pos_win,
+        args=args
     )
     subjects = list(subj_data.keys())
     print(f"[Info] Subjects with enough data: {len(subjects)} -> {subjects[:5]}{'...' if len(subjects)>5 else ''}")
