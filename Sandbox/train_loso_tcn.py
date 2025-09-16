@@ -72,6 +72,48 @@ def getsixchannels(rgb: np.ndarray) -> List[np.ndarray]:
     chrom_x =   3*rgb[0, :] - 2*rgb[1, :]
     return [ycgcr_cg, ycgcr_cr, yiq_i, ydbdr_dr, pos_y, chrom_x]
 
+def get_invariant_channels(rgb: np.ndarray) -> np.ndarray:
+    """
+    rgb: (3, N) 原始 0..255
+    return: (K, N) 追加的強度/白平衡更不敏感特徵
+    """
+    eps = 1e-8
+    R = rgb[0].astype(np.float32)
+    G = rgb[1].astype(np.float32)
+    B = rgb[2].astype(np.float32)
+
+    S = R + G + B + eps
+    # A) 強度尺度不變
+    r = R / S
+    g = G / S
+    # hue（用幾何定義，比 HSV 更平滑）
+    hue = np.arctan2(np.sqrt(3.0) * (B - R), 2.0*G - R - B)
+
+    # NDI / ratio family
+    rg_nd = (R - G) / (R + G + eps)
+    gb_nd = (G - B) / (G + B + eps)
+    rb_nd = (R - B) / (R + B + eps)
+    log_rg = np.log((R + eps) / (G + eps))
+    log_gb = np.log((G + eps) / (B + eps))
+
+    # C) AC/DC（以短窗或整段，先給全段粗略版；若要窗內版本，放到切窗後做）
+    R_mu, G_mu, B_mu = R.mean(), G.mean(), B.mean()
+    acdc_R = (R - R_mu) / (R_mu + eps)
+    acdc_G = (G - G_mu) / (G_mu + eps)
+    acdc_B = (B - B_mu) / (B_mu + eps)
+
+    # D) 一階差分（對 rg/hue 做就好）
+    dr = np.diff(r, prepend=r[0])
+    dg = np.diff(g, prepend=g[0])
+    dh = np.diff(hue, prepend=hue[0])
+
+    feats = np.vstack([
+        r, g, hue, rg_nd, gb_nd, rb_nd, log_rg, log_gb,
+        # acdc_R, acdc_G, acdc_B,
+        # dr, dg, dh
+    ])
+    return feats.astype(np.float32)
+
 def getCCT(rgb_: np.ndarray) -> np.ndarray:
     """
     rgb_: (3, N) in [0..255]
@@ -402,19 +444,25 @@ def prepare_subject_windows(
         if N < seq_len:
             continue
 
-        # 6 通道
         rgb = np.vstack([R, G, B])
-        six_list = getsixchannels(rgb)
-        ch6 = np.stack(six_list, axis=0).astype(np.float32)  # (6,N)
+        chs = []
+
+        # 6 通道
+        # six_list = getsixchannels(rgb)
+        # ch6 = np.stack(six_list, axis=0).astype(np.float32)  # (6,N)
+        # chs.append(ch6)
+
+        # 新增不變特徵
+        inv = get_invariant_channels(rgb)   # (K, N)
+        chs.append(inv)
 
         # optional POS
-        chs = [ch6]
         if use_pos:
             ok, pos = getPOS(R.copy(), G.copy(), B.copy(), win_len=pos_win)
             if ok and pos.size == N:
                 chs.append(pos.reshape(1, -1).astype(np.float32))
         # optional CCT
-        if args is not None and getattr(args, "use_cct", False):
+        if getattr(args, "use_cct", False):
             cct = getCCT(rgb)  # (1,N)
             chs.append(cct.astype(np.float32))
 
