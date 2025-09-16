@@ -1,29 +1,32 @@
 {
-  "mode": "fixed",
   "model": "tcn",
   "train_csv": [
-    "prc-c920.csv",
-    "prc-i15.csv",
-    "prc-i15m.csv",
-    "prc-s9160.csv",
-    "prc-s9180.csv"
+    "data/hm3-c930.csv",
+    "data/hm3-i16.csv",
+    "data/hm3-i16m.csv",
+    "data/hm3-s9360.csv",
+    "data/hm3-s9380.csv"
   ],
   "test_csv": [
-    "prc-c920.csv",
-    "prc-i15.csv",
-    "prc-i15m.csv",
-    "prc-s9160.csv",
-    "prc-s9180.csv",
-    "hm1-c930.csv",
-    "hm2-c930.csv",
-    "hm1-i15.csv",
-    "hm2-i15.csv",
-    "hm1-i15m.csv",
-    "hm2-i15m.csv",
-    "hm1-s9260.csv",
-    "hm1-s9280.csv"
+    "data/hm1-c930.csv",
+    "data/hm1-i15.csv",
+    "data/hm1-i15m.csv",
+    "data/hm1-s9260.csv",
+    "data/hm1-s9280.csv",
+    "data/hm2-c930.csv",
+    "data/hm2-i15.csv",
+    "data/hm2-i15m.csv",
+    "data/hm3-c930.csv",
+    "data/hm3-i16.csv",
+    "data/hm3-i16m.csv",
+    "data/hm3-s9360.csv",
+    "data/hm3-s9380.csv"
   ],
-  "subject_normalization": false,
-  "segment_normalization": true,
-  "use_pos": true
+  "use_pos": false,
+  "use_cct": false,
+  "use_label_weights": true,
+  "weight_gamma": 1.5,
+  "train_normalization": "cumulative",
+  "test_normalization": "cumulative",
+  "save_predictions": true
 }

@@ -44,35 +44,39 @@ def build_command(config):
         "rf_max_depth": None,
         "svr_kernel": "rbf",
         "svr_C": 1.0,
-        "svr_gamma": "scale"
+        "svr_gamma": "scale",
+        "ema_alpha": 0.05,
+        "warmup_sec": 30,
+        "weight_gamma": 1.5
     }
     
     # 基本參數
-    cmd.extend(["--mode", config["mode"]])
     cmd.extend(["--model", config["model"]])
-    
-    # 訓練和測試檔案
-    if config["mode"] == "fixed":
-        cmd.extend(["--train_csv"] + config["train_csv"])
-        cmd.extend(["--test_csv"] + config["test_csv"])
-    elif config["mode"] == "loso":
-        cmd.extend(["--csv", config["csv"]])
+    cmd.extend(["--train_csv"] + config["train_csv"])
+    cmd.extend(["--test_csv"] + config["test_csv"])
+    cmd.extend(["--train_normalization", config["train_normalization"]])
+    cmd.extend(["--test_normalization", config["test_normalization"]])
     
     # 模型參數（使用配置值或預設值）
     for param in ["fps", "seq_sec", "stride_sec", "epochs", "patience", "batch_size", 
-                  "hidden", "levels", "kernel", "dropout", "lr", "seed", "device", "val_ratio"]:
+                  "hidden", "levels", "kernel", "dropout", "lr", "seed", "device", "val_ratio",
+                  "ema_alpha", "warmup_sec"]:
         value = config.get(param, defaults[param])
         cmd.extend([f"--{param}", str(value)])
     
     # 布林參數
-    if config.get("subject_normalization", False):
-        cmd.append("--subject_normalization")
-    if config.get("segment_normalization", False):
-        cmd.append("--segment_normalization")
     if config.get("use_pos", False):
         cmd.append("--use_pos")
         pos_win = config.get("pos_win", defaults["pos_win"])
         cmd.extend(["--pos_win", str(pos_win)])
+    if config.get("use_cct", False):
+        cmd.append("--use_cct")
+    if config.get("save_predictions", False):
+        cmd.append("--save_predictions")
+    if config.get("use_label_weights", False):
+        cmd.append("--use_label_weights")
+        weight_gamma = config.get("weight_gamma", defaults["weight_gamma"])
+        cmd.extend(["--weight_gamma", str(weight_gamma)])
     
     # sklearn 模型參數
     if config["model"] == "rf":
@@ -107,12 +111,12 @@ def main():
     # 顯示將要執行的命令
     print("=" * 60)
     print("實驗配置：")
-    print(f"模式: {config['mode']}")
     print(f"模型: {config['model']}")
-    if config["mode"] == "fixed":
-        print(f"訓練集: {len(config['train_csv'])} 個檔案")
-        print(f"測試集: {len(config['test_csv'])} 個檔案")
-        print(f"有效組合數: {len(config['train_csv']) * len(config['test_csv']) - len(config['train_csv'])}")
+    print(f"訓練時的標準化方式: {config['train_normalization']}")
+    print(f"測試時的標準化方式: {config['test_normalization']}")
+    print(f"訓練集: {len(config['train_csv'])} 個檔案")
+    print(f"測試集: {len(config['test_csv'])} 個檔案")
+    print(f"有效組合數: {len(config['train_csv']) * len(config['test_csv']) - len(config['train_csv'])}")
     print("=" * 60)
     print("執行命令:")
     print(" ".join(cmd))

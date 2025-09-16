@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.metrics import r2_score
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.svm import SVR
 
@@ -72,6 +72,29 @@ def getsixchannels(rgb: np.ndarray) -> List[np.ndarray]:
     chrom_x =   3*rgb[0, :] - 2*rgb[1, :]
     return [ycgcr_cg, ycgcr_cr, yiq_i, ydbdr_dr, pos_y, chrom_x]
 
+def getCCT(rgb_: np.ndarray) -> np.ndarray:
+    """
+    rgb_: (3, N) in [0..255]
+    回傳 shape: (1, N) 的 CCT；若分母為 0 則以極小值保護。
+    公式：McCamy approximation
+    """
+    eps = 1e-8
+    rgb = rgb_.astype(np.float32) / 255.0
+    R, G, B = rgb[0], rgb[1], rgb[2]
+
+    # sRGB D65 -> XYZ（線性）
+    X = 0.4124*R + 0.3576*G + 0.1805*B
+    Y = 0.2126*R + 0.7152*G + 0.0722*B
+    Z = 0.0193*R + 0.1192*G + 0.9505*B
+
+    denom = np.maximum(X + Y + Z, eps)
+    x = X / denom
+    y = Y / denom
+
+    n = (x - 0.3320) / np.maximum(0.1858 - y, eps)
+    CCT = 437*(n**3) + 3601*(n**2) + 6861*n + 5517
+    return CCT.reshape(1, -1).astype(np.float32)
+
 def build_windows(
     X_all: np.ndarray, spo2: np.ndarray, seq_len: int, stride: int
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -85,7 +108,9 @@ def build_windows(
     for start in range(0, N - seq_len + 1, stride):
         end = start + seq_len
         xs.append(X_all[:, start:end])
-        ys.append(float(spo2[start:end].mean()))
+        # ys.append(float(spo2[start:end].mean()))
+        # 使用最後一個值
+        ys.append(float(spo2[end - 1]))
     if len(xs) == 0:
         return np.zeros((0, C, seq_len), dtype=np.float32), np.zeros((0,), dtype=np.float32)
     X = np.stack(xs, axis=0).astype(np.float32)
@@ -93,25 +118,13 @@ def build_windows(
     return X, y
 
 def apply_segment_norm_numpy(X: np.ndarray) -> np.ndarray:
-    """
-    對 numpy 格式的 (N, C, T) 做每個樣本、每通道的 instance normalization。
-    只對前六個特徵進行標準化，第七個特徵（POS）保持不變。
-    """
     if X.size == 0:
         return X
-    
-    # 複製原始數據
-    X_norm = X.copy()
-    
-    # 只對前六個通道進行標準化
-    channels_to_norm = min(6, X.shape[1])  # 確保不超過實際通道數
-    
-    if channels_to_norm > 0:
-        mu = X[:, :channels_to_norm, :].mean(axis=2, keepdims=True)
-        std = X[:, :channels_to_norm, :].std(axis=2, keepdims=True) + 1e-8
-        X_norm[:, :channels_to_norm, :] = (X[:, :channels_to_norm, :] - mu) / std
-    
-    return X_norm
+    Xn = X.copy()
+    mu = Xn.mean(axis=2, keepdims=True)
+    std = Xn.std(axis=2, keepdims=True) + 1e-8
+    Xn = (Xn - mu) / std
+    return Xn
 
 def flatten_windows(X: np.ndarray) -> np.ndarray:
     """(N, C, T) -> (N, C*T) 用於 sklearn 模型。"""
@@ -120,65 +133,119 @@ def flatten_windows(X: np.ndarray) -> np.ndarray:
     N, C, T = X.shape
     return X.reshape(N, C * T)
 
-def streaming_zscore_cumulative(ch6: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+def compute_sample_weights_from_labels(y: np.ndarray, bin_edges: np.ndarray = None, gamma: float = 1.0) -> np.ndarray:
     """
-    對 (C=6, N) 做「累積」z-score：
-    對每個通道 c，t 時刻用 [0..t] 的均值與標準差做標準化。
-    Welford 線上演算法，避免數值不穩。
+    給定 y（SpO2 標籤），依分佈計算每個樣本的權重。
+    預設用 75~100 的整數 bin；權重 = (1 / bin_count) ** gamma，再做 min-max 或均值正規化到 ~1 的量級。
+    """
+    if bin_edges is None:
+        bin_edges = np.arange(74.5, 100.5 + 1e-6, 1.0)  # 75,76,...,100 的邊界
+
+    # 將 y 以整數 SpO2 分箱（或你也可以改成 np.round(y)）
+    y_int = np.clip(np.round(y).astype(int), 75, 100)
+    hist_counts = np.bincount(y_int - 75, minlength=26).astype(np.float64)  # 75..100 共 26 格
+
+    # 避免除以 0：對空 bin 給一個很小的 count
+    hist_counts = np.where(hist_counts > 0, hist_counts, 1.0)
+
+    inv_freq = 1.0 / hist_counts  # 反頻率
+    inv_freq = inv_freq ** max(1.0, gamma)
+
+    # 將每個樣本對應到自己的 bin 權重
+    weights = inv_freq[y_int - 75]
+
+    # 正規化到平均為 1（穩定訓練）
+    weights = weights / (weights.mean() + 1e-8)
+    return weights.astype(np.float32)
+
+def welford_cumulative_stats(ch6: np.ndarray, eps: float = 1e-8):
+    """
+    因果累積（Welford）估計每個 t 的 mu_t, std_t。
+    ch6: (C, N) -> returns mu (C,N), std (C,N)
     """
     C, N = ch6.shape
-    out = np.empty_like(ch6, dtype=np.float32)
+    # 使用 float64 提高精度，避免溢出
+    mu = np.zeros((C, N), dtype=np.float64)
+    M2 = np.zeros((C, N), dtype=np.float64)
+    mu[:, 0] = ch6[:, 0].astype(np.float64)
+    M2[:, 0] = 0.0
+    
+    for t in range(1, N):
+        x = ch6[:, t].astype(np.float64)
+        delta = x - mu[:, t-1]
+        mu[:, t] = mu[:, t-1] + delta / (t + 1)
+        delta2 = x - mu[:, t]
+        M2[:, t] = M2[:, t-1] + delta * delta2
+    
+    var = np.zeros_like(M2)
+    for t in range(N):
+        denom = max(1, t)
+        var[:, t] = M2[:, t] / denom
+    std = np.sqrt(np.maximum(var, 0.0)) + eps
+    
+    # 轉回 float32 以保持與其他代碼的兼容性
+    return mu.astype(np.float32), std.astype(np.float32)
 
-    for c in range(C):
-        mean = 0.0
-        M2 = 0.0
-        for t in range(N):
-            x = float(ch6[c, t])
-            # 更新統計量（t 計數從 1 開始）
-            n = t + 1
-            delta = x - mean
-            mean += delta / n
-            delta2 = x - mean
-            M2 += delta * delta2
-            var = M2 / max(1, n - 1)  # 無偏估計；n=1 時先給極小方差
-            std = math.sqrt(var) if var > 0 else 0.0
-            out[c, t] = (x - mean) / (std + eps)
-    return out
-
-def streaming_zscore_ema(ch6: np.ndarray, alpha: float = 0.05, eps: float = 1e-8) -> np.ndarray:
+def ema_stats_over_time(ch6: np.ndarray, alpha: float = 0.05, eps: float = 1e-8):
     """
-    對 (C=6, N) 做 EMA z-score：
-    mu_t = α x_t + (1-α) mu_{t-1}
-    var_t 用 EMA 近似：v_t = α (x_t - mu_t)^2 + (1-α) v_{t-1}
+    因果 EMA 估 mu_t, std_t（以 EMA 近似變異）。
+    ch6: (C, N) -> returns mu (C,N), std (C,N)
     """
     C, N = ch6.shape
-    out = np.empty_like(ch6, dtype=np.float32)
+    mu = np.zeros((C, N), dtype=np.float32)
+    v  = np.zeros((C, N), dtype=np.float32)
+    mu[:, 0] = ch6[:, 0]
+    v[:, 0]  = 0.0
+    for t in range(1, N):
+        x = ch6[:, t]
+        mu[:, t] = alpha * x + (1 - alpha) * mu[:, t-1]
+        diff = x - mu[:, t]
+        v[:, t]  = alpha * (diff * diff) + (1 - alpha) * v[:, t-1]
+    std = np.sqrt(v) + eps
+    return mu, std
 
-    for c in range(C):
-        mu = float(ch6[c, 0])
-        v  = 0.0
-        out[c, 0] = 0.0
-        for t in range(1, N):
-            x = float(ch6[c, t])
-            mu = alpha * x + (1.0 - alpha) * mu
-            diff = x - mu
-            v   = alpha * (diff * diff) + (1.0 - alpha) * v
-            std = math.sqrt(v)
-            out[c, t] = diff / (std + eps)
-    return out
+def build_windows_stride_frozen(
+    X_all: np.ndarray, spo2: np.ndarray, seq_len: int, stride: int,
+    mu_time: np.ndarray, std_time: np.ndarray, warmup_frames: int = 0
+):
+    C, N = X_all.shape
+    xs, ys = [], []
+    for start in range(0, N - seq_len + 1, stride):
+        end = start + seq_len
+        t_ref = end - 1
+        if t_ref < warmup_frames:
+            continue
+        mu_w  = mu_time[:, t_ref][:, None]   # (C,1)
+        std_w = std_time[:, t_ref][:, None]  # (C,1)
+        x_win = X_all[:, start:end].astype(np.float32).copy()
+        x_win = (x_win - mu_w) / (std_w + 1e-8)
+        xs.append(x_win)
+        # ys.append(float(spo2[start:end].mean()))
+        # 使用最後一個值
+        ys.append(float(spo2[end - 1]))
+    if not xs:
+        return np.zeros((0, C, seq_len), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+    return np.stack(xs, axis=0), np.array(ys, dtype=np.float32)
 
 # -----------------------------
 # Dataset
 # -----------------------------
 class SeqDataset(Dataset):
-    def __init__(self, X: np.ndarray, y: np.ndarray, segment_normalization: bool = False):
+    def __init__(self, X: np.ndarray, y: np.ndarray, segment_normalization: bool = False, weights: np.ndarray = None):
         """
         X: (N, C, T), y: (N,)
         segment_normalization=True 時，對每個樣本做 (x - mean_c)/std_c，按通道 c 各自計算。
+        weights: (N,) 或 None；若提供，訓練時會用於加權 loss。
         """
         self.X = torch.from_numpy(X)        # 直接先轉 tensor，提高效率
         self.y = torch.from_numpy(y)
         self.segment_normalization = segment_normalization
+
+        if weights is None:
+            self.w = torch.ones(len(y), dtype=torch.float32)
+        else:
+            assert len(weights) == len(y), "weights 長度需與 y 相同"
+            self.w = torch.from_numpy(weights.astype(np.float32))
 
     def __len__(self): 
         return self.X.shape[0]
@@ -186,13 +253,11 @@ class SeqDataset(Dataset):
     def __getitem__(self, idx):
         x = self.X[idx]
         if self.segment_normalization:
-            x = x.clone()  # ★ 先複製，避免動到底層儲存
-            channels_to_norm = min(6, x.shape[0])
-            if channels_to_norm > 0:
-                mu  = x[:channels_to_norm].mean(dim=-1, keepdim=True)
-                std = x[:channels_to_norm].std(dim=-1, keepdim=True).clamp_min(1e-8)
-                x[:channels_to_norm] = (x[:channels_to_norm] - mu) / std
-        return x, self.y[idx]
+            x = x.clone()
+            mu  = x.mean(dim=-1, keepdim=True)
+            std = x.std(dim=-1, keepdim=True).clamp_min(1e-8)
+            x = (x - mu) / std
+        return x, self.y[idx], self.w[idx]
 
 # -----------------------------
 # TCN building blocks
@@ -271,24 +336,30 @@ class TCNRegressor(nn.Module):
 # -----------------------------
 def train_one(model, loader, optim, device):
     model.train()
-    crit = nn.MSELoss()
+    crit = nn.MSELoss(reduction='none')
     total = 0.0
-    for xb, yb in loader:
+    n = 0
+    for xb, yb, wb in loader:  # ← 接 weights
         xb = xb.to(device)
         yb = yb.to(device)
+        wb = wb.to(device)
+
         optim.zero_grad()
         pred = model(xb)
-        loss = crit(pred, yb)
+        loss_elem = crit(pred, yb)          # (B,)
+        loss = (loss_elem * wb).mean()      # 加權平均
         loss.backward()
         optim.step()
+
         total += loss.item() * len(xb)
-    return total / max(1, len(loader.dataset))
+        n += len(xb)
+    return total / max(1, n)
 
 @torch.no_grad()
 def eval_one(model, loader, device):
     model.eval()
     preds, trues = [], []
-    for xb, yb in loader:
+    for xb, yb, wb in loader:
         xb = xb.to(device)
         yb = yb.to(device)
         pred = model(xb)
@@ -301,16 +372,17 @@ def eval_one(model, loader, device):
     rmse = math.sqrt(((y_pred - y_true) ** 2).mean())
     mae = np.abs(y_pred - y_true).mean()
     r2 = r2_score(y_true, y_pred)
-    return r2, mae, rmse
+    return r2, mae, rmse, y_pred
 
 # -----------------------------
 # Data preparation for LOSO
 # -----------------------------
 def prepare_subject_windows(
     df: pd.DataFrame, fps: int, seq_sec: int, stride_sec: int,
-    zscore_within_subject: bool = True,
     use_pos: bool = False, pos_win: int = 30,
-    args: argparse.Namespace = None
+    args: argparse.Namespace = None,
+    train_normalization: str = None,  # 新增：訓練時的標準化方式
+    test_normalization: str = None    # 新增：測試時的標準化方式
 ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
     """
     回傳: subject -> (X, y)
@@ -330,59 +402,59 @@ def prepare_subject_windows(
         if N < seq_len:
             continue
 
-        # 6 通道轉換（無濾波）
+        # 6 通道
         rgb = np.vstack([R, G, B])
         six_list = getsixchannels(rgb)
-        ch6 = np.stack(six_list, axis=0).astype(np.float32)  # (6, N)
+        ch6 = np.stack(six_list, axis=0).astype(np.float32)  # (6,N)
 
-        # 受試者內 z-score
-        if zscore_within_subject and args.online_norm == "none":
-            mu = ch6.mean(axis=1, keepdims=True)
-            std = ch6.std(axis=1, keepdims=True) + 1e-8
-            ch6 = (ch6 - mu) / std
-
-        # ★ 新增：線上正規化（只處理前 6 通道）
-        if args.online_norm != "none":
-            if args.online_norm == "cumulative":
-                ch6 = streaming_zscore_cumulative(ch6)
-            elif args.online_norm == "ema":
-                ch6 = streaming_zscore_ema(ch6, alpha=args.ema_alpha)
-
-        # 產生 POS 通道（可選）
+        # optional POS
+        chs = [ch6]
         if use_pos:
             ok, pos = getPOS(R.copy(), G.copy(), B.copy(), win_len=pos_win)
             if ok and pos.size == N:
-                pos_ch = pos.reshape(1, -1).astype(np.float32)  # (1, N)
-                p_mu = pos_ch.mean(axis=1, keepdims=True)
-                pos_ch = pos_ch - p_mu
-                X_all = np.concatenate([ch6, pos_ch], axis=0)  # (7, N)
-            else:
-                # 失敗就只用 6 通道
-                X_all = ch6
-        else:
-            X_all = ch6
+                chs.append(pos.reshape(1, -1).astype(np.float32))
+        # optional CCT
+        if args is not None and getattr(args, "use_cct", False):
+            cct = getCCT(rgb)  # (1,N)
+            chs.append(cct.astype(np.float32))
 
-        # 切視窗
-        Xw, yw = build_windows(X_all, SPO2, seq_len=seq_len, stride=stride)
+        X_all = np.concatenate(chs, axis=0)  # (C, N)  # <= 這裡的 C 可能是 6/7/8
+
+        # 選 normalization 模式
+        norm_mode = train_normalization or test_normalization  # 你原先的判斷
+        mu_time, std_time = None, None
+
+        if norm_mode == "subject":
+            mu = X_all.mean(axis=1, keepdims=True)
+            std = X_all.std(axis=1, keepdims=True) + 1e-8
+            X_all = (X_all - mu) / std
+
+        elif norm_mode == "cumulative":
+            mu_time, std_time = welford_cumulative_stats(X_all)  # <== 改成對 X_all
+        elif norm_mode == "ema":
+            alpha = args.ema_alpha if args is not None else 0.05
+            mu_time, std_time = ema_stats_over_time(X_all, alpha=alpha)
+        # elif norm_mode == "segment": 切窗後再做（在 Dataset / numpy 端）
+
+        # 切窗
+        if norm_mode in ["cumulative", "ema"] and mu_time is not None:
+            warmup_frames = max(0, int((args.warmup_sec if args is not None else 10) * fps))
+            Xw, yw = build_windows_stride_frozen(
+                X_all, SPO2, seq_len=seq_len, stride=stride,
+                mu_time=mu_time, std_time=std_time, warmup_frames=warmup_frames
+            )
+        else:
+            Xw, yw = build_windows(X_all, SPO2, seq_len=seq_len, stride=stride)
+
         if len(Xw):
             result[folder] = (Xw, yw)
 
     return result
 
-def concat_except(subject_dict: Dict[str, Tuple[np.ndarray, np.ndarray]], exclude_key: str):
-    Xs, ys = [], []
-    for k, (X, y) in subject_dict.items():
-        if k == exclude_key: 
-            continue
-        Xs.append(X); ys.append(y)
-    if len(Xs) == 0:
-        return np.zeros((0,)), np.zeros((0,))
-    return np.concatenate(Xs, axis=0), np.concatenate(ys, axis=0)
-
 # -----------------------------
 # Fixed-mode utilities
 # -----------------------------
-def train_model_once(train_path: str, args, device) -> Tuple[any, Dict[str, any]]:
+def train_model_once(train_path: str, args, device, train_normalization: str = None) -> Tuple[any, Dict[str, any]]:
     """訓練一次模型，返回模型和訓練資料資訊"""
     expected_cols = {"Folder","COLOR_R","COLOR_G","COLOR_B","SPO2"}
     df_tr = pd.read_csv(train_path)
@@ -391,9 +463,8 @@ def train_model_once(train_path: str, args, device) -> Tuple[any, Dict[str, any]
 
     subj_tr = prepare_subject_windows(
         df_tr, fps=args.fps, seq_sec=args.seq_sec, stride_sec=args.stride_sec,
-        zscore_within_subject=args.subject_normalization,
         use_pos=args.use_pos, pos_win=args.pos_win,
-        args=args
+        args=args, train_normalization=train_normalization
     )
 
     if len(subj_tr) == 0:
@@ -406,6 +477,12 @@ def train_model_once(train_path: str, args, device) -> Tuple[any, Dict[str, any]
     split = int(n_train * (1.0 - args.val_ratio))
     tr_idx, va_idx = idx[:split], idx[split:]
 
+    # ---- 產生訓練集 sample weight（只用於訓練，不影響驗證） ----
+    train_weights = None
+    if args.use_label_weights:
+        train_weights_all = compute_sample_weights_from_labels(y_train, gamma=args.weight_gamma)
+        train_weights = train_weights_all[tr_idx]  # 只取訓練子集
+
     train_info = {
         "X_train": X_train,
         "y_train": y_train,
@@ -415,8 +492,16 @@ def train_model_once(train_path: str, args, device) -> Tuple[any, Dict[str, any]
     }
 
     if args.model == "tcn":
-        tr_ds = SeqDataset(X_train[tr_idx], y_train[tr_idx], segment_normalization=args.segment_normalization)
-        va_ds = SeqDataset(X_train[va_idx], y_train[va_idx], segment_normalization=args.segment_normalization)
+        tr_ds = SeqDataset(
+            X_train[tr_idx], y_train[tr_idx],
+            segment_normalization=True if args.train_normalization == "segment" else False,
+            weights=train_weights
+        )
+        va_ds = SeqDataset(
+            X_train[va_idx], y_train[va_idx],
+            segment_normalization=True if args.train_normalization == "segment" else False,
+            weights=None  # 驗證集不加權
+        )
 
         tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0)
         va_loader = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
@@ -430,9 +515,9 @@ def train_model_once(train_path: str, args, device) -> Tuple[any, Dict[str, any]
         best_va = float("inf"); best_state = None; patience, bad = args.patience, 0
         for ep in range(1, args.epochs + 1):
             tr_loss = train_one(model, tr_loader, optim, device)
-            r2_va, mae_va, rmse_va = eval_one(model, va_loader, device)
-            if rmse_va < best_va:
-                best_va = rmse_va
+            r2_va, mae_va, rmse_va, y_pred_va = eval_one(model, va_loader, device)
+            if mae_va < best_va:
+                best_va = mae_va
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 bad = 0
             else:
@@ -449,12 +534,17 @@ def train_model_once(train_path: str, args, device) -> Tuple[any, Dict[str, any]
     else:
         # sklearn 模型
         X_train_np = X_train.copy()
-        if args.segment_normalization:
+        if args.train_normalization == "segment":
             X_train_np = apply_segment_norm_numpy(X_train_np)
         Xtr = flatten_windows(X_train_np[tr_idx])
         ytr = y_train[tr_idx]
         Xva = flatten_windows(X_train_np[va_idx])
         yva = y_train[va_idx]
+
+        sample_weight = None
+        if args.use_label_weights:
+            train_weights_all = compute_sample_weights_from_labels(y_train, gamma=args.weight_gamma)
+            sample_weight = train_weights_all[tr_idx]
 
         if args.model == "rf":
             model = RandomForestRegressor(n_estimators=args.rf_estimators,
@@ -471,7 +561,7 @@ def train_model_once(train_path: str, args, device) -> Tuple[any, Dict[str, any]
         else:
             raise ValueError("Unknown sklearn model")
 
-        model.fit(Xtr, ytr)
+        model.fit(Xtr, ytr, sample_weight=sample_weight)
         y_pred_va = model.predict(Xva)
         rmse_va = math.sqrt(((y_pred_va - yva) ** 2).mean())
         mae_va = np.abs(y_pred_va - yva).mean()
@@ -481,7 +571,7 @@ def train_model_once(train_path: str, args, device) -> Tuple[any, Dict[str, any]
         
         return model, train_info
 
-def evaluate_test_with_trained_model(model, train_info: Dict[str, any], test_path: str, args, device) -> Dict[str, float]:
+def evaluate_test_with_trained_model(model, train_info: Dict[str, any], test_path: str, args, device, test_normalization: str = None, save_predictions: bool = False) -> Dict[str, float]:
     """使用已訓練的模型評估測試集"""
     expected_cols = {"Folder","COLOR_R","COLOR_G","COLOR_B","SPO2"}
     df_te = pd.read_csv(test_path)
@@ -490,9 +580,8 @@ def evaluate_test_with_trained_model(model, train_info: Dict[str, any], test_pat
 
     subj_te = prepare_subject_windows(
         df_te, fps=args.fps, seq_sec=args.seq_sec, stride_sec=args.stride_sec,
-        zscore_within_subject=args.subject_normalization,
         use_pos=args.use_pos, pos_win=args.pos_win,
-        args=args
+        args=args, test_normalization=test_normalization
     )
 
     if len(subj_te) == 0:
@@ -506,17 +595,23 @@ def evaluate_test_with_trained_model(model, train_info: Dict[str, any], test_pat
     }
 
     if args.model == "tcn":
-        te_ds = SeqDataset(X_test, y_test, segment_normalization=args.segment_normalization)
+        te_ds = SeqDataset(X_test, y_test, segment_normalization=True if args.test_normalization == "segment" else False)
         te_loader = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
         
-        r2_te, mae_te, rmse_te = eval_one(model, te_loader, device)
+        r2_te, mae_te, rmse_te, y_pred_te = eval_one(model, te_loader, device)
         print(f"[TEST][TCN][{os.path.basename(test_path)}] "
               f"R2={r2_te:.3f} | MAE={mae_te:.2f} | RMSE={rmse_te:.2f}")
         result_row.update({"R2": float(r2_te), "MAE": float(mae_te)})
+        
+        # 如果需要保存預測結果，需要重新計算預測值
+        if save_predictions:
+            result_row["y_true"] = y_test
+            result_row["y_pred"] = y_pred_te
+        
         return result_row
     else:
         X_test_np = X_test.copy()
-        if args.segment_normalization:
+        if args.test_normalization == "segment":
             X_test_np = apply_segment_norm_numpy(X_test_np)
         Xte = flatten_windows(X_test_np)
         yte = y_test
@@ -528,6 +623,12 @@ def evaluate_test_with_trained_model(model, train_info: Dict[str, any], test_pat
         print(f"[TEST][{args.model.upper()}][{os.path.basename(test_path)}] "
               f"R2={r2_te:.3f} | MAE={mae_te:.2f} | RMSE={rmse_te:.2f}")
         result_row.update({"R2": float(r2_te), "MAE": float(mae_te)})
+        
+        # 保存預測結果
+        if save_predictions:
+            result_row["y_true"] = yte
+            result_row["y_pred"] = y_pred_te
+        
         return result_row
 
 # -----------------------------
@@ -536,7 +637,6 @@ def evaluate_test_with_trained_model(model, train_info: Dict[str, any], test_pat
 def main():
     parser = argparse.ArgumentParser()
     # ---- 原有參數（保留） ----
-    parser.add_argument("--csv", type=str, help="Path to data.csv (LOSO mode)")
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--seq_sec", type=int, default=30, help="sequence length in seconds")
     parser.add_argument("--stride_sec", type=int, default=2, help="stride in seconds")
@@ -551,18 +651,23 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--val_ratio", type=float, default=0.1, help="val split from training subjects' windows")
-    parser.add_argument("--subject_normalization", action="store_true", help="enable per-subject z-score normalization")
-    parser.add_argument("--segment_normalization", action="store_true",
-                        help="Apply per-window, per-channel instance normalization on inputs.")
-    parser.add_argument("--online_norm", type=str, default="none",
-                        choices=["none", "cumulative", "ema"],
-                        help="即時正規化模式：none | cumulative(累積) | ema(指數)")
     parser.add_argument("--ema_alpha", type=float, default=0.05,
                         help="EMA 模式下的 α，越大越快追隨變化 (0<α≤1)")
+    parser.add_argument("--warmup_sec", type=int, default=10,
+                        help="warm-up 時長（秒）；在此之前不產生輸出視窗")
+    # 新增：分別控制訓練和測試的標準化方式
+    parser.add_argument("--train_normalization", type=str, default=None,
+                        choices=["none", "subject", "segment", "cumulative", "ema"],
+                        help="訓練時的標準化方式：none | subject | segment | cumulative | ema")
+    parser.add_argument("--test_normalization", type=str, default=None,
+                        choices=["none", "subject", "segment", "cumulative", "ema"],
+                        help="測試時的標準化方式：none | subject | segment | cumulative | ema")
     parser.add_argument("--use_pos", action="store_true",
                         help="Append POS as an extra input channel (no HR prediction).")
     parser.add_argument("--pos_win", type=int, default=30,
                         help="Window length (in samples) for POS overlap-add (default 30 @ 30fps = 1s).")
+    parser.add_argument("--use_cct", action="store_true",
+                        help="Append CCT (correlated color temperature) as an extra input channel.")
     # ---- 新增參數 ----
     parser.add_argument("--model", type=str, default="tcn",
                         choices=["tcn", "rf", "svr"],
@@ -572,13 +677,16 @@ def main():
     parser.add_argument("--svr_kernel", type=str, default="rbf", help="SVR kernel")
     parser.add_argument("--svr_C", type=float, default=1.0, help="SVR C 參數")
     parser.add_argument("--svr_gamma", type=str, default="scale", help="SVR gamma: scale | auto 或數值")
-    parser.add_argument("--mode", type=str, default="loso",
-                        choices=["loso", "fixed"],
-                        help="Evaluation mode: 'loso' (leave-one-subject-out) or 'fixed' (train/test CSV).")
     parser.add_argument("--train_csv", nargs='+', type=str, default=None,
                         help="One or more train CSV paths when --mode fixed")
     parser.add_argument("--test_csv", nargs='+', type=str, default=None,
                         help="One or more test CSV paths when --mode fixed")
+    parser.add_argument("--use_label_weights", action="store_true",
+                        help="啟用依 SpO2 分佈的加權 loss（訓練時）")
+    parser.add_argument("--weight_gamma", type=float, default=1.0,
+                        help="權重指數，>1 會更強化稀有區間；=1 為單純的反頻率")
+    parser.add_argument("--save_predictions", action="store_true",
+                        help="Save prediction results for visualization")
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -586,234 +694,151 @@ def main():
     device = torch.device(args.device)
     print(f"Training Device: {args.device}")
 
-    expected_cols = {"Folder","COLOR_R","COLOR_G","COLOR_B","SPO2"}
+    # --------- FIXED: 優化版本 - 相同訓練集只訓練一次 ---------
+    if not args.train_csv or not args.test_csv:
+        raise ValueError("When --mode fixed, please provide --train_csv and --test_csv.")
 
-    if args.mode == "fixed":
-        # --------- FIXED: 優化版本 - 相同訓練集只訓練一次 ---------
-        if not args.train_csv or not args.test_csv:
-            raise ValueError("When --mode fixed, please provide --train_csv and --test_csv.")
+    # argparse 使用 nargs='+' 時會是 list；保險處理單一路徑字串
+    train_list = args.train_csv if isinstance(args.train_csv, list) else [args.train_csv]
+    test_list  = args.test_csv  if isinstance(args.test_csv, list)  else [args.test_csv]
 
-        # argparse 使用 nargs='+' 時會是 list；保險處理單一路徑字串
-        train_list = args.train_csv if isinstance(args.train_csv, list) else [args.train_csv]
-        test_list  = args.test_csv  if isinstance(args.test_csv, list)  else [args.test_csv]
-
-        combo_rows = []
-        trained_models = {}  # 快取已訓練的模型
-        
-        for tr_path in train_list:
-            if tr_path not in trained_models:
-                print(f"\n[TRAINING] {os.path.basename(tr_path)}")
-                model, train_info = train_model_once(tr_path, args, device)
-                trained_models[tr_path] = (model, train_info)
-            else:
-                print(f"\n[REUSING] {os.path.basename(tr_path)}")
-                model, train_info = trained_models[tr_path]
-            
-            for te_path in test_list:
-                # 跳過相同的訓練和測試檔案（避免資料洩漏）
-                if tr_path == te_path:
-                    print(f"[SKIP] {os.path.basename(tr_path)} -> {os.path.basename(te_path)} (相同檔案，跳過)")
-                    continue
-                
-                print(f"[TESTING] {os.path.basename(tr_path)} -> {os.path.basename(te_path)}")
-                row = evaluate_test_with_trained_model(model, train_info, te_path, args, device)
-                row["train_csv"] = os.path.basename(tr_path)  # 補上訓練檔案名稱
-                combo_rows.append(row)
-
-        if len(combo_rows):
-            df = pd.DataFrame(combo_rows)
-            
-            # 分別產出 R2 和 MAE 的 CSV
-            r2_pivot = df.pivot(index='train_csv', columns='test_csv', values='R2')
-            mae_pivot = df.pivot(index='train_csv', columns='test_csv', values='MAE')
-            
-            # 重置 index 名稱
-            r2_pivot.index.name = 'train_file'
-            mae_pivot.index.name = 'train_file'
-            
-            # 儲存 CSV 檔案
-            r2_pivot.to_csv("fixed_combo_results_R2.csv")
-            mae_pivot.to_csv("fixed_combo_results_MAE.csv")
-            
-            print(f"\nSaved: fixed_combo_results_R2.csv")
-            print(f"Saved: fixed_combo_results_MAE.csv")
-            
-            # 生成熱圖
-            try:
-                import matplotlib.pyplot as plt
-                import seaborn as sns
-                
-                # 設定中文字體
-                plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
-                plt.rcParams['axes.unicode_minus'] = False
-                
-                # 處理欄位名稱：移除 .csv 後綴
-                r2_pivot_clean = r2_pivot.copy()
-                mae_pivot_clean = mae_pivot.copy()
-                
-                # 移除 columns 的 .csv 後綴
-                r2_pivot_clean.columns = [col.replace('.csv', '') for col in r2_pivot_clean.columns]
-                mae_pivot_clean.columns = [col.replace('.csv', '') for col in mae_pivot_clean.columns]
-                
-                # 移除 index 的 .csv 後綴
-                r2_pivot_clean.index = [idx.replace('.csv', '') for idx in r2_pivot_clean.index]
-                mae_pivot_clean.index = [idx.replace('.csv', '') for idx in mae_pivot_clean.index]
-                
-                # 創建子圖
-                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
-                
-                # R2 熱圖
-                sns.heatmap(r2_pivot_clean, annot=True, fmt='.2f', cmap='RdYlGn', 
-                           center=0.0, ax=ax1, cbar_kws={'label': 'R2 Score'},
-                           annot_kws={'fontsize': 8})
-                ax1.set_title('R2 Score Heatmap')
-                ax1.set_xlabel('Test')
-                ax1.set_ylabel('Train')
-                # 旋轉 x 軸標籤 45 度
-                ax1.set_xticklabels(ax1.get_xticklabels(), rotation=45, ha='right')
-                ax1.set_yticklabels(ax1.get_yticklabels(), rotation=0)
-                
-                # MAE 熱圖 - 修復顯示問題
-                sns.heatmap(mae_pivot_clean, annot=True, fmt='.1f', cmap='RdYlGn_r', 
-                           center=10.0, ax=ax2, cbar_kws={'label': 'MAE'},
-                           annot_kws={'fontsize': 8})
-                ax2.set_title('MAE Heatmap')
-                ax2.set_xlabel('Test')
-                ax2.set_ylabel('Train')
-                # 旋轉 x 軸標籤 45 度
-                ax2.set_xticklabels(ax2.get_xticklabels(), rotation=45, ha='right')
-                ax2.set_yticklabels(ax2.get_yticklabels(), rotation=0)
-                
-                plt.tight_layout()
-                plt.savefig('fixed_combo_heatmap.png', dpi=300, bbox_inches='tight')
-                print(f"Saved: fixed_combo_heatmap.png")
-                
-            except ImportError:
-                print("注意：無法生成熱圖，請安裝 matplotlib 和 seaborn")
-                print("pip install matplotlib seaborn")
-        return
-
-    # --------- LOSO（維持你原本流程，僅小調整） ---------
-    if not args.csv:
-        raise ValueError("When --mode loso, please provide --csv.")
-    df = pd.read_csv(args.csv)
-    if not expected_cols.issubset(set(df.columns)):
-        raise ValueError(f"CSV must contain columns: {expected_cols}")
-
-    subj_data = prepare_subject_windows(
-        df, fps=args.fps, seq_sec=args.seq_sec, stride_sec=args.stride_sec,
-        zscore_within_subject=args.subject_normalization,
-        use_pos=args.use_pos, pos_win=args.pos_win,
-        args=args
-    )
-    subjects = list(subj_data.keys())
-    print(f"[Info] Subjects with enough data: {len(subjects)} -> {subjects[:5]}{'...' if len(subjects)>5 else ''}")
-
-    all_rows = []
-    for test_subj in subjects:
-        X_train_np, y_train_np = concat_except(subj_data, exclude_key=test_subj)
-        X_test_np,  y_test_np  = subj_data[test_subj]
-        if len(X_test_np) == 0 or len(X_train_np) == 0:
-            continue
-
-        n_train = len(X_train_np)
-        idx = np.arange(n_train); np.random.shuffle(idx)
-        split = int(n_train * (1.0 - args.val_ratio))
-        tr_idx, va_idx = idx[:split], idx[split:]
-
-        if args.model == "tcn":
-            tr_ds = SeqDataset(X_train_np[tr_idx], y_train_np[tr_idx], segment_normalization=args.segment_normalization)
-            va_ds = SeqDataset(X_train_np[va_idx], y_train_np[va_idx], segment_normalization=args.segment_normalization)
-            te_ds = SeqDataset(X_test_np,        y_test_np,        segment_normalization=args.segment_normalization)
-
-            tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0)
-            va_loader = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
-            te_loader = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
-
-            n_channels = X_train_np.shape[1]
-            model = TCNRegressor(
-                n_channels=n_channels, hidden=args.hidden, levels=args.levels,
-                kernel_size=args.kernel, dropout=args.dropout
-            ).to(device)
-
-            optim = torch.optim.Adam(model.parameters(), lr=args.lr)
-            best_va = float("inf"); best_state = None; patience, bad = 10, 0
-            for ep in range(1, args.epochs + 1):
-                tr_loss = train_one(model, tr_loader, optim, device)
-                r2_va, mae_va, rmse_va = eval_one(model, va_loader, device)
-                if rmse_va < best_va:
-                    best_va = rmse_va
-                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                    bad = 0
-                else:
-                    bad += 1
-                print(f"[{test_subj}][TCN] Epoch {ep:03d} | train MSE:{tr_loss:.4f} | val R2:{r2_va:.3f} MAE:{mae_va:.2f} RMSE:{rmse_va:.2f}")
-                if bad >= patience:
-                    print(f"[{test_subj}][TCN] Early stopping."); break
-
-            if best_state is not None:
-                model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
-            r2_te, mae_te, rmse_te = eval_one(model, te_loader, device)
-            row = {"test_subject": test_subj, "n_test_windows": len(X_test_np),
-                   "R2": float(r2_te), "MAE": float(mae_te), "RMSE": float(rmse_te)}
-            all_rows.append(row)
-            print(f"[TEST {test_subj}][TCN] R2={row['R2']:.3f} | MAE={row['MAE']:.2f} | RMSE={row['RMSE']:.2f}")
+    combo_rows = []
+    trained_models = {}  # 快取已訓練的模型
+    
+    for tr_path in train_list:
+        if tr_path not in trained_models:
+            print(f"\n[TRAINING] {os.path.basename(tr_path)}")
+            model, train_info = train_model_once(tr_path, args, device, args.train_normalization)
+            trained_models[tr_path] = (model, train_info)
         else:
-            Xtr_full = X_train_np.copy()
-            Xte_full = X_test_np.copy()
-            if args.segment_normalization:
-                Xtr_full = apply_segment_norm_numpy(Xtr_full)
-                Xte_full = apply_segment_norm_numpy(Xte_full)
-            Xtr = flatten_windows(Xtr_full[tr_idx])
-            ytr = y_train_np[tr_idx]
-            Xva = flatten_windows(Xtr_full[va_idx])
-            yva = y_train_np[va_idx]
-            Xte = flatten_windows(Xte_full)
-            yte = y_test_np
+            print(f"\n[REUSING] {os.path.basename(tr_path)}")
+            model, train_info = trained_models[tr_path]
+        
+        for te_path in test_list:
+            # 跳過相同的訓練和測試檔案（避免資料洩漏）
+            if tr_path == te_path:
+                print(f"[SKIP] {os.path.basename(tr_path)} -> {os.path.basename(te_path)} (相同檔案，跳過)")
+                continue
+            
+            print(f"[TESTING] {os.path.basename(tr_path)} -> {os.path.basename(te_path)}")
+            row = evaluate_test_with_trained_model(model, train_info, te_path, args, device, args.test_normalization, args.save_predictions)
+            row["train_csv"] = os.path.basename(tr_path)  # 補上訓練檔案名稱
+            combo_rows.append(row)
 
-            if args.model == "rf":
-                model = RandomForestRegressor(n_estimators=args.rf_estimators,
-                                              max_depth=args.rf_max_depth,
-                                              n_jobs=-1,
-                                              random_state=args.seed)
-            elif args.model == "svr":
-                gamma_val = args.svr_gamma
-                try:
-                    gamma_val = float(args.svr_gamma)
-                except Exception:
-                    pass
-                model = SVR(kernel=args.svr_kernel, C=args.svr_C, gamma=gamma_val)
-            else:
-                raise ValueError("Unknown sklearn model")
+    if len(combo_rows):
+        df = pd.DataFrame(combo_rows)
+        
+        # 分別產出 R2 和 MAE 的 CSV
+        r2_pivot = df.pivot(index='train_csv', columns='test_csv', values='R2')
+        mae_pivot = df.pivot(index='train_csv', columns='test_csv', values='MAE')
+        
+        # 重置 index 名稱
+        r2_pivot.index.name = 'train_file'
+        mae_pivot.index.name = 'train_file'
+        
+        # 儲存 CSV 檔案
+        r2_pivot.to_csv("fixed_combo_results_R2.csv")
+        mae_pivot.to_csv("fixed_combo_results_MAE.csv")
+        
+        print(f"\nSaved: fixed_combo_results_R2.csv")
+        print(f"Saved: fixed_combo_results_MAE.csv")
+        
+        # 保存預測結果（如果啟用）
+        if args.save_predictions:
+            predictions_data = []
+            for _, row in df.iterrows():
+                if 'y_true' in row and 'y_pred' in row:
+                    y_true = row['y_true']
+                    y_pred = row['y_pred']
+                    for i in range(len(y_true)):
+                        predictions_data.append({
+                            'train_file': row['train_csv'],
+                            'test_file': row['test_csv'],
+                            'model': row['model'],
+                            'true_label': y_true[i],
+                            'prediction': y_pred[i]
+                        })
+            
+            if predictions_data:
+                predictions_df = pd.DataFrame(predictions_data)
+                predictions_df.to_csv('predictions_results.csv', index=False)
+                print(f"Saved: predictions_results.csv")
+        
 
-            model.fit(Xtr, ytr)
-            y_pred_va = model.predict(Xva)
-            rmse_va = math.sqrt(((y_pred_va - yva) ** 2).mean())
-            mae_va = np.abs(y_pred_va - yva).mean()
-            r2_va = r2_score(yva, y_pred_va)
-            print(f"[{test_subj}][{args.model.upper()}] val R2:{r2_va:.3f} MAE:{mae_va:.2f} RMSE:{rmse_va:.2f}")
+        import matplotlib
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        from matplotlib.colors import TwoSlopeNorm
+        
+        # 設定中文字體
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
+        
+        # 處理欄位名稱：移除 .csv 後綴
+        r2_pivot_clean = r2_pivot.copy()
+        mae_pivot_clean = mae_pivot.copy()
+        
+        # 移除 columns 的 .csv 後綴
+        r2_pivot_clean.columns = [col.replace('.csv', '') for col in r2_pivot_clean.columns]
+        mae_pivot_clean.columns = [col.replace('.csv', '') for col in mae_pivot_clean.columns]
+        
+        # 移除 index 的 .csv 後綴
+        r2_pivot_clean.index = [idx.replace('.csv', '') for idx in r2_pivot_clean.index]
+        mae_pivot_clean.index = [idx.replace('.csv', '') for idx in mae_pivot_clean.index]
+        
+        # 創建子圖
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
 
-            y_pred_te = model.predict(Xte)
-            rmse_te = math.sqrt(((y_pred_te - yte) ** 2).mean())
-            mae_te = np.abs(y_pred_te - yte).mean()
-            r2_te = r2_score(yte, y_pred_te)
-            row = {"test_subject": test_subj, "n_test_windows": len(X_test_np),
-                   "R2": float(r2_te), "MAE": float(mae_te), "RMSE": float(rmse_te)}
-            all_rows.append(row)
-            print(f"[TEST {test_subj}][{args.model.upper()}] R2={row['R2']:.3f} | MAE={row['MAE']:.2f} | RMSE={row['RMSE']:.2f}")
+        r2_vals = r2_pivot_clean.values.astype(float)
 
-    if len(all_rows):
-        out = pd.DataFrame(all_rows).sort_values("R2", ascending=False)
-        print("\n=== LOSO Summary ===")
-        print(out.to_string(index=False))
-        print("\nAverages:")
-        print(f"mean R2  : {out['R2'].mean():.3f}")
-        print(f"mean MAE : {out['MAE'].mean():.2f}")
-        print(f"mean RMSE: {out['RMSE'].mean():.2f}")
-        out.to_csv("loso_tcn_results.csv", index=False)
-        print("\nSaved: loso_tcn_results.csv")
-    else:
-        print("No results produced (check data/window settings).")
+        # 忽略 NaN 取 min/max
+        vmin = np.nanmin(r2_vals)
+        vmax = np.nanmax(r2_vals)
+
+        if not (vmin < 0 < vmax):
+            vmin = min(vmin, -1e-6)
+            vmax = max(vmax,  1e-6)
+
+        norm = TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
+
+        # ---- 自訂 colorbar 刻度 ----
+        neg_ticks = np.arange(np.floor(vmin/10)*10, 0, 10)
+        pos_step = 0.05 if vmax <= 1 else vmax/4
+        pos_ticks = np.arange(0, vmax + 1e-9, pos_step) if vmax > 0 else np.array([0.0])
+        ticks = np.unique(np.concatenate([neg_ticks, [0.0], pos_ticks]))
+
+        def format_colorbar_tick(value):
+            return f"{value:.2f}" if -1 < value < 1 else f"{int(value)}"
+
+        sns.heatmap(
+            r2_pivot_clean, annot=True, fmt='.2f',
+            cmap='RdYlGn', norm=norm, mask=np.isnan(r2_vals),
+            ax=ax1,
+            cbar_kws={'label': 'R²', 'ticks': ticks, 'format': matplotlib.ticker.FuncFormatter(lambda x, pos: format_colorbar_tick(x))},
+            annot_kws={'fontsize': 8}
+        )
+        ax1.set_title('R² Heatmap')
+        ax1.set_xlabel('Test')
+        ax1.set_ylabel('Train')
+        # 旋轉 x 軸標籤 45 度
+        ax1.set_xticklabels(ax1.get_xticklabels(), rotation=45, ha='right')
+        ax1.set_yticklabels(ax1.get_yticklabels(), rotation=0)
+        
+        # MAE 熱圖 - 修復顯示問題
+        sns.heatmap(mae_pivot_clean, annot=True, fmt='.1f', cmap='RdYlGn_r', 
+                    center=10.0, ax=ax2, cbar_kws={'label': 'MAE'},
+                    annot_kws={'fontsize': 8})
+        ax2.set_title('MAE Heatmap')
+        ax2.set_xlabel('Test')
+        ax2.set_ylabel('Train')
+        # 旋轉 x 軸標籤 45 度
+        ax2.set_xticklabels(ax2.get_xticklabels(), rotation=45, ha='right')
+        ax2.set_yticklabels(ax2.get_yticklabels(), rotation=0)
+        
+        plt.tight_layout()
+        plt.savefig('fixed_combo_heatmap.png', dpi=300, bbox_inches='tight')
+        print(f"Saved: fixed_combo_heatmap.png")
+
 
 if __name__ == "__main__":
     main()
