@@ -26,8 +26,8 @@ def build_command(config):
     # 預設值
     defaults = {
         "fps": 30,
-        "seq_sec": 30,
-        "stride_sec": 2,
+        "seq_sec": 1,
+        "stride_sec": 1,
         "epochs": 40,
         "patience": 10,
         "batch_size": 512,
@@ -47,7 +47,9 @@ def build_command(config):
         "svr_gamma": "scale",
         "ema_alpha": 0.05,
         "warmup_sec": 30,
-        "weight_gamma": 1.5
+        "weight_gamma": 1.5,
+        "cct_interval": 100,
+        "min_samples_per_cct": 100
     }
     
     # 基本參數
@@ -60,7 +62,8 @@ def build_command(config):
     # 模型參數（使用配置值或預設值）
     for param in ["fps", "seq_sec", "stride_sec", "epochs", "patience", "batch_size", 
                   "hidden", "levels", "kernel", "dropout", "lr", "seed", "device", "val_ratio",
-                  "ema_alpha", "warmup_sec"]:
+                  "ema_alpha", "warmup_sec", "weight_gamma", 
+                  "cct_interval", "min_samples_per_cct"]:
         value = config.get(param, defaults[param])
         cmd.extend([f"--{param}", str(value)])
     
@@ -75,8 +78,8 @@ def build_command(config):
         cmd.append("--save_predictions")
     if config.get("use_label_weights", False):
         cmd.append("--use_label_weights")
-        weight_gamma = config.get("weight_gamma", defaults["weight_gamma"])
-        cmd.extend(["--weight_gamma", str(weight_gamma)])
+    if config.get("cct_based_training", False):
+        cmd.append("--cct_based_training")
     
     # sklearn 模型參數
     if config["model"] == "rf":

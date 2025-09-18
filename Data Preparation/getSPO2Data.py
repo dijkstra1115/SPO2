@@ -3,8 +3,8 @@ import numpy as np
 import os
 from typing import List, Optional
 
-DATA_DIR = "//169.254.2.1/Algorithm/HehuanMountain2_SPO2"
-DEVICE = "iPhone 15 Pro Max-Front"
+DATA_DIR = "//169.254.2.1/Algorithm/HehuanMountain3_SPO2"
+DEVICE = "SM-S9380-Front"
 META_FILE = "Meta.csv"
 SPO2_MIN = 70
 SPO2_MAX = 100

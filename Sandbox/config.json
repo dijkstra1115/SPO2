@@ -15,18 +15,16 @@
     "data/hm1-s9280.csv",
     "data/hm2-c930.csv",
     "data/hm2-i15.csv",
-    "data/hm2-i15m.csv",
-    "data/hm3-c930.csv",
-    "data/hm3-i16.csv",
-    "data/hm3-i16m.csv",
-    "data/hm3-s9360.csv",
-    "data/hm3-s9380.csv"
+    "data/hm2-i15m.csv"
   ],
   "use_pos": false,
   "use_cct": false,
   "use_label_weights": true,
-  "weight_gamma": 1.5,
+  "use_domain_adaptation": true,
   "train_normalization": "cumulative",
   "test_normalization": "cumulative",
-  "save_predictions": true
+  "save_predictions": true,
+  "cct_based_training": true,
+  "cct_interval": 100,
+  "min_samples_per_cct": 100
 }
