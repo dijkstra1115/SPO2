@@ -502,122 +502,6 @@ def prepare_subject_windows(
 # -----------------------------
 # Fixed-mode utilities
 # -----------------------------
-def train_model_once(train_path: str, args, device, train_normalization: str = None) -> Tuple[any, Dict[str, any]]:
-    """訓練一次模型，返回模型和訓練資料資訊"""
-    expected_cols = {"Folder","COLOR_R","COLOR_G","COLOR_B","SPO2"}
-    df_tr = pd.read_csv(train_path)
-    if not expected_cols.issubset(df_tr.columns):
-        raise ValueError(f"CSV must contain columns: {expected_cols}")
-
-    subj_tr = prepare_subject_windows(
-        df_tr, fps=args.fps, seq_sec=args.seq_sec, stride_sec=args.stride_sec,
-        use_pos=args.use_pos, pos_win=args.pos_win,
-        args=args, train_normalization=train_normalization
-    )
-
-    if len(subj_tr) == 0:
-        raise ValueError("No train subjects produced windows. Check seq_sec/stride_sec.")
-    X_train = np.concatenate([v[0] for v in subj_tr.values()], axis=0)
-    y_train = np.concatenate([v[1] for v in subj_tr.values()], axis=0)
-
-    n_train = len(X_train)
-    idx = np.arange(n_train); np.random.shuffle(idx)
-    split = int(n_train * (1.0 - args.val_ratio))
-    tr_idx, va_idx = idx[:split], idx[split:]
-
-    # ---- 產生訓練集 sample weight（只用於訓練，不影響驗證） ----
-    train_weights = None
-    if args.use_label_weights:
-        train_weights_all = compute_sample_weights_from_labels(y_train, gamma=args.weight_gamma)
-        train_weights = train_weights_all[tr_idx]  # 只取訓練子集
-
-    train_info = {
-        "X_train": X_train,
-        "y_train": y_train,
-        "tr_idx": tr_idx,
-        "va_idx": va_idx,
-        "n_channels": X_train.shape[1]
-    }
-
-    if args.model == "tcn":
-        tr_ds = SeqDataset(
-            X_train[tr_idx], y_train[tr_idx],
-            segment_normalization=True if args.train_normalization == "segment" else False,
-            weights=train_weights
-        )
-        va_ds = SeqDataset(
-            X_train[va_idx], y_train[va_idx],
-            segment_normalization=True if args.train_normalization == "segment" else False,
-            weights=None  # 驗證集不加權
-        )
-
-        tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0)
-        va_loader = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
-
-        model = TCNRegressor(
-            n_channels=train_info["n_channels"], hidden=args.hidden, levels=args.levels,
-            kernel_size=args.kernel, dropout=args.dropout
-        ).to(device)
-
-        optim = torch.optim.Adam(model.parameters(), lr=args.lr)
-        best_va = float("inf"); best_state = None; patience, bad = args.patience, 0
-        for ep in range(1, args.epochs + 1):
-            tr_loss = train_one(model, tr_loader, optim, device)
-            r2_va, mae_va, rmse_va, y_pred_va = eval_one(model, va_loader, device)
-            if mae_va < best_va:
-                best_va = mae_va
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                bad = 0
-            else:
-                bad += 1
-            print(f"[TRAIN][TCN][{os.path.basename(train_path)}] "
-                  f"Epoch {ep:03d} | train MSE:{tr_loss:.4f} | val R2:{r2_va:.3f} MAE:{mae_va:.2f} RMSE:{rmse_va:.2f}")
-            if bad >= patience:
-                print("[TRAIN][TCN] Early stopping."); break
-
-        if best_state is not None:
-            model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
-        
-        return model, train_info
-    else:
-        # sklearn 模型
-        X_train_np = X_train.copy()
-        if args.train_normalization == "segment":
-            X_train_np = apply_segment_norm_numpy(X_train_np)
-        Xtr = flatten_windows(X_train_np[tr_idx])
-        ytr = y_train[tr_idx]
-        Xva = flatten_windows(X_train_np[va_idx])
-        yva = y_train[va_idx]
-
-        sample_weight = None
-        if args.use_label_weights:
-            train_weights_all = compute_sample_weights_from_labels(y_train, gamma=args.weight_gamma)
-            sample_weight = train_weights_all[tr_idx]
-
-        if args.model == "rf":
-            model = RandomForestRegressor(n_estimators=args.rf_estimators,
-                                          max_depth=args.rf_max_depth,
-                                          n_jobs=-1,
-                                          random_state=args.seed)
-        elif args.model == "svr":
-            gamma_val = args.svr_gamma
-            try:
-                gamma_val = float(args.svr_gamma)
-            except Exception:
-                pass
-            model = SVR(kernel=args.svr_kernel, C=args.svr_C, gamma=gamma_val)
-        else:
-            raise ValueError("Unknown sklearn model")
-
-        model.fit(Xtr, ytr, sample_weight=sample_weight)
-        y_pred_va = model.predict(Xva)
-        rmse_va = math.sqrt(((y_pred_va - yva) ** 2).mean())
-        mae_va = np.abs(y_pred_va - yva).mean()
-        r2_va = r2_score(yva, y_pred_va)
-        print(f"[TRAIN][{args.model.upper()}][{os.path.basename(train_path)}] "
-              f"val R2:{r2_va:.3f} MAE:{mae_va:.2f} RMSE:{rmse_va:.2f}")
-        
-        return model, train_info
 
 def evaluate_test_with_trained_model(model, train_info: Dict[str, any], test_path: str, args, device, test_normalization: str = None, save_predictions: bool = False) -> Dict[str, float]:
     """使用已訓練的模型評估測試集"""
@@ -751,27 +635,143 @@ def main():
     test_list  = args.test_csv  if isinstance(args.test_csv, list)  else [args.test_csv]
 
     combo_rows = []
-    trained_models = {}  # 快取已訓練的模型
+    
+    # 合併所有訓練資料
+    print(f"\n[COMBINING] 合併 {len(train_list)} 個訓練檔案...")
+    all_subj_tr = {}
     
     for tr_path in train_list:
-        if tr_path not in trained_models:
-            print(f"\n[TRAINING] {os.path.basename(tr_path)}")
-            model, train_info = train_model_once(tr_path, args, device, args.train_normalization)
-            trained_models[tr_path] = (model, train_info)
-        else:
-            print(f"\n[REUSING] {os.path.basename(tr_path)}")
-            model, train_info = trained_models[tr_path]
+        print(f"[LOADING] {os.path.basename(tr_path)}")
+        expected_cols = {"Folder","COLOR_R","COLOR_G","COLOR_B","SPO2"}
+        df_tr = pd.read_csv(tr_path)
+        if not expected_cols.issubset(df_tr.columns):
+            raise ValueError(f"CSV must contain columns: {expected_cols}")
         
-        for te_path in test_list:
-            # 跳過相同的訓練和測試檔案（避免資料洩漏）
-            if tr_path == te_path:
-                print(f"[SKIP] {os.path.basename(tr_path)} -> {os.path.basename(te_path)} (相同檔案，跳過)")
-                continue
-            
-            print(f"[TESTING] {os.path.basename(tr_path)} -> {os.path.basename(te_path)}")
-            row = evaluate_test_with_trained_model(model, train_info, te_path, args, device, args.test_normalization, args.save_predictions)
-            row["train_csv"] = os.path.basename(tr_path)  # 補上訓練檔案名稱
-            combo_rows.append(row)
+        subj_tr = prepare_subject_windows(
+            df_tr, fps=args.fps, seq_sec=args.seq_sec, stride_sec=args.stride_sec,
+            use_pos=args.use_pos, pos_win=args.pos_win,
+            args=args, train_normalization=args.train_normalization
+        )
+        
+        # 合併到總的訓練資料中，使用檔案名作為前綴避免受試者ID衝突
+        file_prefix = os.path.splitext(os.path.basename(tr_path))[0]
+        for subj_id, (X, y) in subj_tr.items():
+            new_subj_id = f"{file_prefix}_{subj_id}"
+            all_subj_tr[new_subj_id] = (X, y)
+    
+    if len(all_subj_tr) == 0:
+        raise ValueError("No train subjects produced windows. Check seq_sec/stride_sec.")
+    
+    print(f"[COMBINED] 總共合併了 {len(all_subj_tr)} 個受試者的資料")
+    
+    # 使用合併後的資料訓練單一模型
+    print(f"\n[TRAINING] 使用合併資料訓練單一模型...")
+    X_train = np.concatenate([v[0] for v in all_subj_tr.values()], axis=0)
+    y_train = np.concatenate([v[1] for v in all_subj_tr.values()], axis=0)
+
+    n_train = len(X_train)
+    idx = np.arange(n_train); np.random.shuffle(idx)
+    split = int(n_train * (1.0 - args.val_ratio))
+    tr_idx, va_idx = idx[:split], idx[split:]
+
+    # ---- 產生訓練集 sample weight（只用於訓練，不影響驗證） ----
+    train_weights = None
+    if args.use_label_weights:
+        train_weights_all = compute_sample_weights_from_labels(y_train, gamma=args.weight_gamma)
+        train_weights = train_weights_all[tr_idx]  # 只取訓練子集
+
+    train_info = {
+        "X_train": X_train,
+        "y_train": y_train,
+        "tr_idx": tr_idx,
+        "va_idx": va_idx,
+        "n_channels": X_train.shape[1]
+    }
+
+    if args.model == "tcn":
+        tr_ds = SeqDataset(
+            X_train[tr_idx], y_train[tr_idx],
+            segment_normalization=True if args.train_normalization == "segment" else False,
+            weights=train_weights
+        )
+        va_ds = SeqDataset(
+            X_train[va_idx], y_train[va_idx],
+            segment_normalization=True if args.train_normalization == "segment" else False,
+            weights=None  # 驗證集不加權
+        )
+
+        tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0)
+        va_loader = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+
+        model = TCNRegressor(
+            n_channels=train_info["n_channels"], hidden=args.hidden, levels=args.levels,
+            kernel_size=args.kernel, dropout=args.dropout
+        ).to(device)
+
+        optim = torch.optim.Adam(model.parameters(), lr=args.lr)
+        best_va = float("inf"); best_state = None; patience, bad = args.patience, 0
+        for ep in range(1, args.epochs + 1):
+            tr_loss = train_one(model, tr_loader, optim, device)
+            r2_va, mae_va, rmse_va, y_pred_va = eval_one(model, va_loader, device)
+            if mae_va < best_va:
+                best_va = mae_va
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                bad = 0
+            else:
+                bad += 1
+            print(f"[TRAIN][TCN][合併資料] "
+                  f"Epoch {ep:03d} | train MSE:{tr_loss:.4f} | val R2:{r2_va:.3f} MAE:{mae_va:.2f} RMSE:{rmse_va:.2f}")
+            if bad >= patience:
+                print("[TRAIN][TCN] Early stopping."); break
+
+        if best_state is not None:
+            model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+        
+        print(f"[TRAINED] 模型訓練完成，最終 R2: {r2_va:.4f}, MAE: {mae_va:.4f}")
+    else:
+        # sklearn 模型
+        X_train_np = X_train.copy()
+        if args.train_normalization == "segment":
+            X_train_np = apply_segment_norm_numpy(X_train_np)
+        Xtr = flatten_windows(X_train_np[tr_idx])
+        ytr = y_train[tr_idx]
+        Xva = flatten_windows(X_train_np[va_idx])
+        yva = y_train[va_idx]
+
+        sample_weight = None
+        if args.use_label_weights:
+            train_weights_all = compute_sample_weights_from_labels(y_train, gamma=args.weight_gamma)
+            sample_weight = train_weights_all[tr_idx]
+
+        if args.model == "rf":
+            model = RandomForestRegressor(n_estimators=args.rf_estimators,
+                                          max_depth=args.rf_max_depth,
+                                          n_jobs=-1,
+                                          random_state=args.seed)
+        elif args.model == "svr":
+            gamma_val = args.svr_gamma
+            try:
+                gamma_val = float(gamma_val)
+            except:
+                gamma_val = "scale" if gamma_val == "scale" else "auto"
+            model = SVR(kernel="rbf", gamma=gamma_val, C=args.svr_C)
+        else:
+            raise ValueError(f"Unknown model: {args.model}")
+
+        model.fit(Xtr, ytr, sample_weight=sample_weight)
+        y_pred_va = model.predict(Xva)
+        r2_va = r2_score(yva, y_pred_va)
+        mae_va = np.mean(np.abs(yva - y_pred_va))
+        rmse_va = np.sqrt(np.mean((yva - y_pred_va) ** 2))
+        
+        print(f"[TRAINED] 模型訓練完成，R2: {r2_va:.4f}, MAE: {mae_va:.4f}")
+    
+    # 使用單一模型測試所有測試資料
+    for te_path in test_list:
+        print(f"[TESTING] 合併模型 -> {os.path.basename(te_path)}")
+        row = evaluate_test_with_trained_model(model, train_info, te_path, args, device, args.test_normalization, args.save_predictions)
+        row["train_csv"] = "combined_all"  # 標記為合併訓練
+        combo_rows.append(row)
 
     if len(combo_rows):
         df = pd.DataFrame(combo_rows)
