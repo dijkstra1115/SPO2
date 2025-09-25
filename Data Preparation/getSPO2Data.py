@@ -5,26 +5,28 @@ from typing import List, Optional
 
 DATA_DIR = "//169.254.2.1/Algorithm/HehuanMountain3_SPO2"
 DEVICE = "SM-S9380-Front"
-META_FILE = "Meta.csv"
+META_FILE = "Meta_oxygen.csv"
 SPO2_MIN = 70
 SPO2_MAX = 100
 IQA_MOTION_THRESHOLD = 0.9
 
-def process_folder_data(folder_name: str, data_dir: str) -> Optional[pd.DataFrame]:
+def process_folder_data(folder_name: str, data_dir: str) -> Optional[List[pd.DataFrame]]:
     """
     處理單一 Folder 的資料，合併 {DEVICE}.csv 和 masimo.csv
     
     過濾條件：
     1. SPO2 資料內插成與 dump 相同的單位（偵）
-    2. IQA Motion < 0.9 的偵及後續所有偵都會被過濾掉
-    3. 只保留 SPO2 在 70-99 範圍內的資料
+    2. 將連續的 IQA Motion >= 0.9 的數據視為獨立序列
+    3. 跳過 IQA Motion < 0.9 的數據段
+    4. 只保留長度 >= 30 偵的序列
+    5. 只保留 SPO2 在 70-99 範圍內的資料
     
     Args:
         folder_name: Folder 名稱
         data_dir: 資料根目錄
         
     Returns:
-        合併後的 DataFrame 或 None (如果處理失敗)
+        包含多個序列的 DataFrame 列表，或 None (如果處理失敗)
     """
     try:
         # 讀取 {DEVICE}.csv (RGB 資料 + IQA Motion)
@@ -77,54 +79,72 @@ def process_folder_data(folder_name: str, data_dir: str) -> Optional[pd.DataFram
         # 找出 SPO2 缺失的位置
         spo2_valid_mask = ~np.isnan(spo2_expanded)
         
-        # 找出 IQA Motion < 閾值的位置（該偵及後續所有偵都要過濾掉）
+        # 找出 IQA Motion >= 閾值的位置
         iqa_motion = dump_data["IQA Motion"].values
-        iqa_invalid_mask = iqa_motion < IQA_MOTION_THRESHOLD
-        
-        # 找到第一個 IQA Motion < 閾值的位置
-        first_invalid_idx = np.argmax(iqa_invalid_mask) if iqa_invalid_mask.any() else len(iqa_invalid_mask)
-        
-        # 如果找到無效位置，則該位置及之後的所有資料都過濾掉
-        if first_invalid_idx < len(iqa_invalid_mask):
-            print(f"  - IQA Motion < {IQA_MOTION_THRESHOLD} 從第 {first_invalid_idx} 偵開始，過濾掉 {len(iqa_invalid_mask) - first_invalid_idx} 偵")
-            # 創建 IQA Motion 有效遮罩（只保留無效位置之前的資料）
-            iqa_valid_mask = np.zeros(len(iqa_invalid_mask), dtype=bool)
-            iqa_valid_mask[:first_invalid_idx] = True
-        else:
-            iqa_valid_mask = np.ones(len(iqa_invalid_mask), dtype=bool)
-            print(f"  - IQA Motion 全部有效")
+        iqa_valid_mask = iqa_motion >= IQA_MOTION_THRESHOLD
         
         # 找出 SPO2 在指定範圍內的位置
         spo2_range_mask = (spo2_expanded >= SPO2_MIN) & (spo2_expanded <= SPO2_MAX)
         
         # 結合所有過濾條件：SPO2 非缺失、IQA Motion 有效、SPO2 在指定範圍內
         valid_mask = spo2_valid_mask & iqa_valid_mask & spo2_range_mask
-
-        # 只要有數據不符合條件，則過濾掉整個 Folder
-        if not valid_mask.all():
-            print(f"  - 警告: {folder_name} 過濾後無有效資料")
+        
+        # 找出連續的有效序列
+        sequences = []
+        current_start = None
+        current_length = 0
+        
+        for i, is_valid in enumerate(valid_mask):
+            if is_valid:
+                if current_start is None:
+                    # 開始新的序列
+                    current_start = i
+                    current_length = 1
+                else:
+                    # 繼續當前序列
+                    current_length += 1
+            else:
+                if current_start is not None:
+                    # 結束當前序列
+                    if current_length >= 30:  # 只保留長度 >= 30 的序列
+                        sequences.append((current_start, current_start + current_length))
+                        print(f"  - 找到有效序列: 第 {current_start+1}-{current_start + current_length} 偵 ({current_length} 偵)")
+                    else:
+                        print(f"  - 跳過短序列: 第 {current_start+1}-{current_start + current_length} 偵 ({current_length} 偵 < 30)")
+                    current_start = None
+                    current_length = 0
+        
+        # 處理最後一個序列
+        if current_start is not None and current_length >= 30:
+            sequences.append((current_start, current_start + current_length))
+            print(f"  - 找到有效序列: 第 {current_start+1}-{current_start + current_length} 偵 ({current_length} 偵)")
+        elif current_start is not None:
+            print(f"  - 跳過短序列: 第 {current_start+1}-{current_start + current_length} 偵 ({current_length} 偵 < 30)")
+        
+        if not sequences:
+            print(f"  - 警告: {folder_name} 沒有找到長度 >= 30 的有效序列")
             return None
         
-        # 過濾掉無效的資料
-        dump_filtered = dump_data[valid_mask]
-        spo2_filtered = spo2_expanded[valid_mask]
+        # 為每個序列建立 DataFrame
+        result_dataframes = []
+        for seq_idx, (start_idx, end_idx) in enumerate(sequences, 1):
+            # 提取序列數據
+            seq_dump = dump_data.iloc[start_idx:end_idx]
+            seq_spo2 = spo2_expanded[start_idx:end_idx]
+            
+            # 建立序列的 DataFrame
+            seq_df = pd.DataFrame({
+                'Folder': [f"{folder_name}_seq{seq_idx}"] * len(seq_dump),
+                'COLOR_R': seq_dump["COLOR_R"].values,
+                'COLOR_G': seq_dump["COLOR_G"].values,
+                'COLOR_B': seq_dump["COLOR_B"].values,
+                'SPO2': seq_spo2
+            })
+            
+            result_dataframes.append(seq_df)
+            print(f"  - 序列 {seq_idx}: {len(seq_df)} 偵")
         
-        print(f"  - 過濾後有效資料: {len(dump_filtered)} 偵")
-        
-        if len(dump_filtered) == 0:
-            print(f"  - 警告: {folder_name} 過濾後無有效資料")
-            return None
-        
-        # 建立最終的 DataFrame
-        result_df = pd.DataFrame({
-            'Folder': [folder_name] * len(dump_filtered),
-            'COLOR_R': dump_filtered["COLOR_R"].values,
-            'COLOR_G': dump_filtered["COLOR_G"].values,
-            'COLOR_B': dump_filtered["COLOR_B"].values,
-            'SPO2': spo2_filtered
-        })
-        
-        return result_df
+        return result_dataframes
         
     except FileNotFoundError as e:
         print(f"  - 錯誤: 找不到檔案 {e}")
@@ -176,12 +196,12 @@ def merge_all_folders(data_dir: str, output_path: str = "data.csv", max_folders:
     for i, folder in enumerate(folders, 1):
         print(f"\n處理 Folder {i}/{len(folders)}: {folder}")
         
-        folder_data = process_folder_data(folder, data_dir)
+        folder_sequences = process_folder_data(folder, data_dir)
         
-        if folder_data is not None:
-            all_data.append(folder_data)
+        if folder_sequences is not None:
+            all_data.extend(folder_sequences)
             successful_folders += 1
-            print(f"  - 成功處理，資料筆數: {len(folder_data)}")
+            print(f"  - 成功處理，找到 {len(folder_sequences)} 個序列，總資料筆數: {sum(len(seq) for seq in folder_sequences)}")
         else:
             print(f"  - 處理失敗，跳過")
     
@@ -195,11 +215,23 @@ def merge_all_folders(data_dir: str, output_path: str = "data.csv", max_folders:
         print(f"  - 總資料筆數: {len(final_df)}")
         print(f"  - 欄位: {list(final_df.columns)}")
         
-        # 顯示每個 Folder 的資料統計
-        folder_stats = final_df.groupby('Folder').size()
-        print(f"  - 每個 Folder 的資料筆數:")
-        for folder, count in folder_stats.items():
-            print(f"    {folder}: {count} 筆")
+        # 顯示每個序列的資料統計
+        sequence_stats = final_df.groupby('Folder').size()
+        print(f"  - 每個序列的資料筆數:")
+        for sequence, count in sequence_stats.items():
+            print(f"    {sequence}: {count} 筆")
+        
+        # 統計原始 Folder 的序列數量
+        original_folders = {}
+        for sequence in sequence_stats.index:
+            original_folder = sequence.split('_seq')[0]
+            if original_folder not in original_folders:
+                original_folders[original_folder] = 0
+            original_folders[original_folder] += 1
+        
+        print(f"  - 每個原始 Folder 的序列數量:")
+        for folder, seq_count in original_folders.items():
+            print(f"    {folder}: {seq_count} 個序列")
         
         # 輸出到檔案
         final_df.to_csv(output_path, index=False)

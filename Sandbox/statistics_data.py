@@ -93,7 +93,13 @@ def analyze_data_files():
                 spo2_range = f"{df['SPO2'].min()}-{df['SPO2'].max()}"
                 print(f"  🩸 SPO2 範圍: {spo2_range}")
                 print(f"  🩸 SPO2 唯一值: {sorted(spo2_values)}")
-                print(f"  🩸 SPO2 分佈: {df['SPO2'].value_counts().sort_index().to_dict()}")
+                
+                # 詳細的 SPO2 分佈統計
+                spo2_counts = df['SPO2'].value_counts().sort_index()
+                print(f"  🩸 SPO2 分佈統計:")
+                for spo2_val, count in spo2_counts.items():
+                    percentage = (count / len(df)) * 100
+                    print(f"    {spo2_val}%: {count:,} 次 ({percentage:.1f}%)")
             
             # 將數據添加到總體分析
             df['file_source'] = filename
@@ -123,6 +129,13 @@ def analyze_data_files():
                 print(f"    主體數: {device_data['Folder'].str.extract(subject_pattern)[0].nunique()}")
                 if 'SPO2' in device_data.columns:
                     print(f"    SPO2 範圍: {device_data['SPO2'].min()}-{device_data['SPO2'].max()}")
+                    
+                    # 設備類型的 SPO2 分佈
+                    print(f"    SPO2 分佈:")
+                    device_spo2_counts = device_data['SPO2'].value_counts().sort_index()
+                    for spo2_val, count in device_spo2_counts.items():
+                        percentage = (count / len(device_data)) * 100
+                        print(f"      {spo2_val}%: {count:,} 次 ({percentage:.1f}%)")
         
         # 顏色通道統計
         print(f"\n🎨 顏色通道統計:")
