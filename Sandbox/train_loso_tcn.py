@@ -8,7 +8,6 @@ import math
 import random
 import numpy as np
 import pandas as pd
-from scipy import signal
 from typing import Dict, List, Tuple
 
 import torch
@@ -78,40 +77,32 @@ def get_invariant_channels(rgb: np.ndarray) -> np.ndarray:
     rgb: (3, N) 原始 0..255
     return: (K, N) 追加的強度/白平衡更不敏感特徵
     """
+    from scipy.signal import butter, filtfilt
+    def butter_filter(sig, fs=30, cutoff=0.1, btype='low', order=3):
+        nyq = 0.5 * fs
+        Wn = cutoff / nyq if np.isscalar(cutoff) else [c / nyq for c in cutoff]
+        b, a = butter(order, Wn, btype=btype)
+        return filtfilt(b, a, sig)
+
     eps = 1e-8
-    R = rgb[0].astype(np.float32)
-    G = rgb[1].astype(np.float32)
-    B = rgb[2].astype(np.float32)
 
-    S = R + G + B + eps
-    # A) 強度尺度不變
-    r = R / S
-    g = G / S
-    # hue（用幾何定義，比 HSV 更平滑）
-    hue = np.arctan2(np.sqrt(3.0) * (B - R), 2.0*G - R - B)
+    R_raw = rgb[0]
+    R_dc = butter_filter(R_raw, fs=30, cutoff=0.1, btype='low', order=3)
+    R_ac = butter_filter(R_raw, fs=30, cutoff=[0.7, 3.0], btype='band', order=3)
+    R_acdc = R_ac / (R_dc + eps)
 
-    # NDI / ratio family
-    rg_nd = (R - G) / (R + G + eps)
-    gb_nd = (G - B) / (G + B + eps)
-    rb_nd = (R - B) / (R + B + eps)
-    log_rg = np.log((R + eps) / (G + eps))
-    log_gb = np.log((G + eps) / (B + eps))
+    G_raw = rgb[1]
+    G_dc = butter_filter(G_raw, fs=30, cutoff=0.1, btype='low', order=3)
+    G_ac = butter_filter(G_raw, fs=30, cutoff=[0.7, 3.0], btype='band', order=3)
+    G_acdc = G_ac / (G_dc + eps)
 
-    # C) AC/DC（以短窗或整段，先給全段粗略版；若要窗內版本，放到切窗後做）
-    R_mu, G_mu, B_mu = R.mean(), G.mean(), B.mean()
-    acdc_R = (R - R_mu) / (R_mu + eps)
-    acdc_G = (G - G_mu) / (G_mu + eps)
-    acdc_B = (B - B_mu) / (B_mu + eps)
-
-    # D) 一階差分（對 rg/hue 做就好）
-    dr = np.diff(r, prepend=r[0])
-    dg = np.diff(g, prepend=g[0])
-    dh = np.diff(hue, prepend=hue[0])
+    B_raw = rgb[2]
+    B_dc = butter_filter(B_raw, fs=30, cutoff=0.1, btype='low', order=3)
+    B_ac = butter_filter(B_raw, fs=30, cutoff=[0.7, 3.0], btype='band', order=3)
+    B_acdc = B_ac / (B_dc + eps)
 
     feats = np.vstack([
-        r, g, hue, rg_nd, gb_nd, rb_nd, log_rg, log_gb,
-        # acdc_R, acdc_G, acdc_B,
-        # dr, dg, dh
+        R_acdc, G_acdc, B_acdc
     ])
     return feats.astype(np.float32)
 
@@ -176,30 +167,64 @@ def flatten_windows(X: np.ndarray) -> np.ndarray:
     N, C, T = X.shape
     return X.reshape(N, C * T)
 
-def compute_sample_weights_from_labels(y: np.ndarray, bin_edges: np.ndarray = None, gamma: float = 1.0) -> np.ndarray:
-    """
-    給定 y（SpO2 標籤），依分佈計算每個樣本的權重。
-    預設用 75~100 的整數 bin；權重 = (1 / bin_count) ** gamma，再做 min-max 或均值正規化到 ~1 的量級。
-    """
-    if bin_edges is None:
-        bin_edges = np.arange(74.5, 100.5 + 1e-6, 1.0)  # 75,76,...,100 的邊界
 
-    # 將 y 以整數 SpO2 分箱（或你也可以改成 np.round(y)）
+def undersample_by_median(y: np.ndarray, random_state: int = 42) -> np.ndarray:
+    """
+    基於中位數的下採樣策略：
+    1. 計算所有 SpO2 類別（75-100）的樣本數量
+    2. 取中位數 m 作為基準
+    3. 對樣本數 > m 的類別進行下採樣至 m 個樣本
+    4. 返回下採樣後的索引
+    
+    Args:
+        y: SpO2 標籤數組
+        random_state: 隨機種子
+    
+    Returns:
+        下採樣後的樣本索引
+    """
+    np.random.seed(random_state)
+    
+    # 將 y 以整數 SpO2 分箱
     y_int = np.clip(np.round(y).astype(int), 75, 100)
-    hist_counts = np.bincount(y_int - 75, minlength=26).astype(np.float64)  # 75..100 共 26 格
-
-    # 避免除以 0：對空 bin 給一個很小的 count
-    hist_counts = np.where(hist_counts > 0, hist_counts, 1.0)
-
-    inv_freq = 1.0 / hist_counts  # 反頻率
-    inv_freq = inv_freq ** max(1.0, gamma)
-
-    # 將每個樣本對應到自己的 bin 權重
-    weights = inv_freq[y_int - 75]
-
-    # 正規化到平均為 1（穩定訓練）
-    weights = weights / (weights.mean() + 1e-8)
-    return weights.astype(np.float32)
+    
+    # 計算每個類別的樣本數量
+    unique_labels, counts = np.unique(y_int, return_counts=True)
+    
+    # 計算中位數作為基準
+    median_count = np.median(counts)
+    print(f"[UNDERSAMPLE] 各類別樣本數: {dict(zip(unique_labels, counts))}")
+    print(f"[UNDERSAMPLE] 中位數基準: {median_count:.0f}")
+    
+    # 收集要保留的索引
+    selected_indices = []
+    
+    for label in unique_labels:
+        # 找到該類別的所有樣本索引
+        label_indices = np.where(y_int == label)[0]
+        label_count = len(label_indices)
+        
+        if label_count > median_count:
+            # 下採樣至中位數
+            selected_count = int(median_count)
+            selected_label_indices = np.random.choice(
+                label_indices, size=selected_count, replace=False
+            )
+            print(f"[UNDERSAMPLE] SpO2={label}: {label_count} -> {selected_count}")
+        else:
+            # 保持原樣本數
+            selected_label_indices = label_indices
+            print(f"[UNDERSAMPLE] SpO2={label}: {label_count} (保持)")
+        
+        selected_indices.extend(selected_label_indices)
+    
+    # 轉換為 numpy 數組並排序
+    selected_indices = np.array(selected_indices)
+    selected_indices.sort()
+    
+    print(f"[UNDERSAMPLE] 總樣本數: {len(y)} -> {len(selected_indices)}")
+    
+    return selected_indices
 
 def welford_cumulative_stats(ch6: np.ndarray, eps: float = 1e-8):
     """
@@ -375,21 +400,14 @@ def simple_filter_pipeline(rgb, fs=30.0,
 # Dataset
 # -----------------------------
 class SeqDataset(Dataset):
-    def __init__(self, X: np.ndarray, y: np.ndarray, segment_normalization: bool = False, weights: np.ndarray = None):
+    def __init__(self, X: np.ndarray, y: np.ndarray, segment_normalization: bool = False):
         """
         X: (N, C, T), y: (N,)
         segment_normalization=True 時，對每個樣本做 (x - mean_c)/std_c，按通道 c 各自計算。
-        weights: (N,) 或 None；若提供，訓練時會用於加權 loss。
         """
         self.X = torch.from_numpy(X)        # 直接先轉 tensor，提高效率
         self.y = torch.from_numpy(y)
         self.segment_normalization = segment_normalization
-
-        if weights is None:
-            self.w = torch.ones(len(y), dtype=torch.float32)
-        else:
-            assert len(weights) == len(y), "weights 長度需與 y 相同"
-            self.w = torch.from_numpy(weights.astype(np.float32))
 
     def __len__(self): 
         return self.X.shape[0]
@@ -401,7 +419,7 @@ class SeqDataset(Dataset):
             mu  = x.mean(dim=-1, keepdim=True)
             std = x.std(dim=-1, keepdim=True).clamp_min(1e-8)
             x = (x - mu) / std
-        return x, self.y[idx], self.w[idx]
+        return x, self.y[idx]
 
 # -----------------------------
 # TCN building blocks
@@ -480,18 +498,16 @@ class TCNRegressor(nn.Module):
 # -----------------------------
 def train_one(model, loader, optim, device):
     model.train()
-    crit = nn.MSELoss(reduction='none')
+    crit = nn.MSELoss()
     total = 0.0
     n = 0
-    for xb, yb, wb in loader:  # ← 接 weights
+    for xb, yb in loader:
         xb = xb.to(device)
         yb = yb.to(device)
-        wb = wb.to(device)
 
         optim.zero_grad()
         pred = model(xb)
-        loss_elem = crit(pred, yb)          # (B,)
-        loss = (loss_elem * wb).mean()      # 加權平均
+        loss = crit(pred, yb)
         loss.backward()
         optim.step()
 
@@ -503,7 +519,7 @@ def train_one(model, loader, optim, device):
 def eval_one(model, loader, device):
     model.eval()
     preds, trues = [], []
-    for xb, yb, wb in loader:
+    for xb, yb in loader:
         xb = xb.to(device)
         yb = yb.to(device)
         pred = model(xb)
@@ -550,30 +566,34 @@ def prepare_subject_windows(
         chs = []
 
         # 簡化濾波：bandpass filter + Savitzky-Golay
-        rgb_filtered = simple_filter_pipeline(
-            rgb, fs=fps,
-            low_freq=0.7,        # 帶通濾波器低頻截止 (Hz)
-            high_freq=3.0,      # 帶通濾波器高頻截止 (Hz)
-            savgol_window=15,   # Savitzky-Golay 窗口長度
-            savgol_polyorder=3,  # Savitzky-Golay 多項式階數
-            axis=-1
-        )
-        rgb = rgb_filtered
+        if args.use_denoising:
+            rgb_filtered = simple_filter_pipeline(
+                rgb, fs=fps,
+                low_freq=0.7,        # 帶通濾波器低頻截止 (Hz)
+                high_freq=3.0,      # 帶通濾波器高頻截止 (Hz)
+                savgol_window=15,   # Savitzky-Golay 窗口長度
+                savgol_polyorder=3,  # Savitzky-Golay 多項式階數
+                axis=-1
+            )
+            rgb = rgb_filtered
 
         # 6 通道
-        six_list = getsixchannels(rgb)
-        ch6 = np.stack(six_list, axis=0).astype(np.float32)  # (6,N)
-        chs.append(ch6)
+        if args.use_ch6:
+            six_list = getsixchannels(rgb)
+            ch6 = np.stack(six_list, axis=0).astype(np.float32)  # (6,N)
+            chs.append(ch6)
 
         # 新增不變特徵
-        # inv = get_invariant_channels(rgb)   # (K, N)
-        # chs.append(inv)
+        if args.use_invariant:
+            inv = get_invariant_channels(rgb)   # (K, N)
+            chs.append(inv)
 
         # optional POS
         if use_pos:
             ok, pos = getPOS(R.copy(), G.copy(), B.copy(), win_len=pos_win)
             if ok and pos.size == N:
                 chs.append(pos.reshape(1, -1).astype(np.float32))
+        
         # optional CCT
         if getattr(args, "use_cct", False):
             cct = getCCT(rgb)  # (1,N)
@@ -638,11 +658,13 @@ def train_model_once(train_path: str, args, device, train_normalization: str = N
     split = int(n_train * (1.0 - args.val_ratio))
     tr_idx, va_idx = idx[:split], idx[split:]
 
-    # ---- 產生訓練集 sample weight（只用於訓練，不影響驗證） ----
-    train_weights = None
-    if args.use_label_weights:
-        train_weights_all = compute_sample_weights_from_labels(y_train, gamma=args.weight_gamma)
-        train_weights = train_weights_all[tr_idx]  # 只取訓練子集
+    # ---- 下採樣處理（只用於訓練，不影響驗證） ----
+    train_indices = tr_idx.copy()
+    if args.use_undersampling:
+        # 對訓練集進行下採樣
+        undersampled_indices = undersample_by_median(y_train[tr_idx], random_state=args.seed)
+        train_indices = tr_idx[undersampled_indices]
+        print(f"[UNDERSAMPLE] 訓練集下採樣: {len(tr_idx)} -> {len(train_indices)}")
 
     train_info = {
         "X_train": X_train,
@@ -654,14 +676,12 @@ def train_model_once(train_path: str, args, device, train_normalization: str = N
 
     if args.model == "tcn":
         tr_ds = SeqDataset(
-            X_train[tr_idx], y_train[tr_idx],
-            segment_normalization=True if args.train_normalization == "segment" else False,
-            weights=train_weights
+            X_train[train_indices], y_train[train_indices],
+            segment_normalization=True if args.train_normalization == "segment" else False
         )
         va_ds = SeqDataset(
             X_train[va_idx], y_train[va_idx],
-            segment_normalization=True if args.train_normalization == "segment" else False,
-            weights=None  # 驗證集不加權
+            segment_normalization=True if args.train_normalization == "segment" else False
         )
 
         tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0)
@@ -677,8 +697,8 @@ def train_model_once(train_path: str, args, device, train_normalization: str = N
         for ep in range(1, args.epochs + 1):
             tr_loss = train_one(model, tr_loader, optim, device)
             r2_va, mae_va, rmse_va, y_pred_va = eval_one(model, va_loader, device)
-            if mae_va < best_va:
-                best_va = mae_va
+            if rmse_va < best_va:
+                best_va = rmse_va
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 bad = 0
             else:
@@ -697,15 +717,10 @@ def train_model_once(train_path: str, args, device, train_normalization: str = N
         X_train_np = X_train.copy()
         if args.train_normalization == "segment":
             X_train_np = apply_segment_norm_numpy(X_train_np)
-        Xtr = flatten_windows(X_train_np[tr_idx])
-        ytr = y_train[tr_idx]
+        Xtr = flatten_windows(X_train_np[train_indices])  # 使用下採樣後的訓練集
+        ytr = y_train[train_indices]
         Xva = flatten_windows(X_train_np[va_idx])
         yva = y_train[va_idx]
-
-        sample_weight = None
-        if args.use_label_weights:
-            train_weights_all = compute_sample_weights_from_labels(y_train, gamma=args.weight_gamma)
-            sample_weight = train_weights_all[tr_idx]
 
         if args.model == "rf":
             model = RandomForestRegressor(n_estimators=args.rf_estimators,
@@ -722,7 +737,7 @@ def train_model_once(train_path: str, args, device, train_normalization: str = N
         else:
             raise ValueError("Unknown sklearn model")
 
-        model.fit(Xtr, ytr, sample_weight=sample_weight)
+        model.fit(Xtr, ytr)  # 不再使用 sample_weight
         y_pred_va = model.predict(Xva)
         rmse_va = math.sqrt(((y_pred_va - yva) ** 2).mean())
         mae_va = np.abs(y_pred_va - yva).mean()
@@ -754,6 +769,19 @@ def evaluate_test_with_trained_model(model, train_info: Dict[str, any], test_pat
         "test_csv": os.path.basename(test_path),
         "model": args.model,
     }
+    
+    # 計算每個受試者的第一個窗口 MAE
+    first_window_mae_per_subject = {}
+
+    # 獲取訓練檔案名稱（用於圖表檔名）
+    train_file_name = os.path.basename(getattr(args, 'current_train_path', 'unknown'))
+    test_file_name = os.path.basename(test_path)
+    
+    # 創建按 train_test 分組的圖表保存目錄
+    train_base = train_file_name.replace('.csv', '')
+    test_base = test_file_name.replace('.csv', '')
+    plot_dir = f"subject_plots/{train_base}_{test_base}"
+    os.makedirs(plot_dir, exist_ok=True)
 
     if args.model == "tcn":
         te_ds = SeqDataset(X_test, y_test, segment_normalization=True if args.test_normalization == "segment" else False)
@@ -764,10 +792,21 @@ def evaluate_test_with_trained_model(model, train_info: Dict[str, any], test_pat
               f"R2={r2_te:.3f} | MAE={mae_te:.2f} | RMSE={rmse_te:.2f}")
         result_row.update({"R2": float(r2_te), "MAE": float(mae_te)})
         
+        # 繪製每個 subject 的預測結果（如果啟用）
+        if args.enable_subject_plots:
+            _plot_subject_predictions(subj_te, y_pred_te, train_file_name, test_file_name, plot_dir, args)
+        
+        # 計算每個受試者的第一個窗口 MAE（如果啟用）
+        if args.enable_first_window_mae:
+            _calculate_first_window_mae(subj_te, y_pred_te, first_window_mae_per_subject)
+        
         # 如果需要保存預測結果，需要重新計算預測值
         if save_predictions:
             result_row["y_true"] = y_test
             result_row["y_pred"] = y_pred_te
+        
+        # 添加第一個窗口 MAE 結果
+        result_row["first_window_mae_per_subject"] = first_window_mae_per_subject
         
         return result_row
     else:
@@ -785,12 +824,128 @@ def evaluate_test_with_trained_model(model, train_info: Dict[str, any], test_pat
               f"R2={r2_te:.3f} | MAE={mae_te:.2f} | RMSE={rmse_te:.2f}")
         result_row.update({"R2": float(r2_te), "MAE": float(mae_te)})
         
+        # 繪製每個 subject 的預測結果（如果啟用）
+        if args.enable_subject_plots:
+            _plot_subject_predictions(subj_te, y_pred_te, train_file_name, test_file_name, plot_dir, args)
+        
+        # 計算每個受試者的第一個窗口 MAE（如果啟用）
+        if args.enable_first_window_mae:
+            _calculate_first_window_mae(subj_te, y_pred_te, first_window_mae_per_subject)
+        
         # 保存預測結果
         if save_predictions:
             result_row["y_true"] = yte
             result_row["y_pred"] = y_pred_te
         
+        # 添加第一個窗口 MAE 結果
+        result_row["first_window_mae_per_subject"] = first_window_mae_per_subject
+        
         return result_row
+
+def _plot_subject_predictions(subj_te: Dict[str, Tuple[np.ndarray, np.ndarray]], 
+                            y_pred_te: np.ndarray, 
+                            train_file_name: str, 
+                            test_file_name: str, 
+                            plot_dir: str, 
+                            args) -> None:
+    """
+    為每個測試 subject 繪製預測結果圖表
+    
+    Args:
+        subj_te: subject -> (X, y) 的字典
+        y_pred_te: 所有測試樣本的預測值
+        train_file_name: 訓練檔案名稱
+        test_file_name: 測試檔案名稱
+        plot_dir: 圖表保存目錄
+        args: 參數對象
+    """
+    import matplotlib.pyplot as plt
+    
+    # 計算每個 subject 的樣本範圍
+    subject_ranges = {}
+    start_idx = 0
+    
+    for subject_name, (X_subj, y_subj) in subj_te.items():
+        n_samples = len(X_subj)
+        subject_ranges[subject_name] = (start_idx, start_idx + n_samples)
+        start_idx += n_samples
+    
+    # 為每個 subject 繪製圖表
+    for subject_name, (start_idx, end_idx) in subject_ranges.items():
+        y_true_subj = np.concatenate([subj_te[subject_name][1]])
+        y_pred_subj = y_pred_te[start_idx:end_idx]
+        
+        # 創建時間軸（樣本索引）
+        time_axis = np.arange(len(y_true_subj))
+        
+        # 創建圖表
+        plt.figure(figsize=(12, 6))
+        plt.plot(time_axis, y_true_subj, 'b-', label='Ground Truth', linewidth=1.5, alpha=0.8)
+        plt.plot(time_axis, y_pred_subj, 'r-', label='Prediction', linewidth=1.5, alpha=0.8)
+        
+        # 設置圖表屬性
+        plt.xlabel('Time (samples)')
+        plt.ylabel('SpO2 (%)')
+        plt.title(f'SpO2 Prediction Results\nTrain: {train_file_name.replace(".csv", "")} | Test: {test_file_name.replace(".csv", "")} | Subject: {subject_name}')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # 設置 Y 軸範圍
+        all_values = np.concatenate([y_true_subj, y_pred_subj])
+        y_min, y_max = np.min(all_values), np.max(all_values)
+        y_range = y_max - y_min
+        plt.ylim(y_min - 0.1 * y_range, y_max + 0.1 * y_range)
+        
+        # 計算該 subject 的評估指標
+        mae_subj = np.abs(y_pred_subj - y_true_subj).mean()
+        r2_subj = r2_score(y_true_subj, y_pred_subj)
+        
+        # 在圖表上顯示評估指標
+        plt.text(0.02, 0.98, f'MAE: {mae_subj:.2f}\nR²: {r2_subj:.3f}', 
+                transform=plt.gca().transAxes, 
+                verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        # 保存圖表
+        plot_filename = f"{subject_name}.png"
+        plot_path = os.path.join(plot_dir, plot_filename)
+        plt.tight_layout()
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"[PLOT] Saved: {plot_path}")
+
+def _calculate_first_window_mae(subj_te: Dict[str, Tuple[np.ndarray, np.ndarray]], 
+                               y_pred_te: np.ndarray, 
+                               first_window_mae_per_subject: Dict[str, float]) -> None:
+    """
+    計算每個受試者的第一個窗口 MAE
+    
+    Args:
+        subj_te: subject -> (X, y) 的字典
+        y_pred_te: 所有測試樣本的預測值
+        first_window_mae_per_subject: 用於存儲結果的字典
+    """
+    # 計算每個 subject 的樣本範圍
+    subject_ranges = {}
+    start_idx = 0
+    
+    for subject_name, (X_subj, y_subj) in subj_te.items():
+        n_samples = len(X_subj)
+        subject_ranges[subject_name] = (start_idx, start_idx + n_samples)
+        start_idx += n_samples
+    
+    # 計算每個 subject 的第一個窗口 MAE
+    for subject_name, (start_idx, end_idx) in subject_ranges.items():
+        y_true_subj = subj_te[subject_name][1]
+        y_pred_subj = y_pred_te[start_idx:end_idx]
+        
+        # 計算第一個窗口的 MAE
+        if len(y_true_subj) > 0 and len(y_pred_subj) > 0:
+            first_window_mae = np.abs(y_pred_subj[0] - y_true_subj[0])
+            first_window_mae_per_subject[subject_name] = float(first_window_mae)
+        else:
+            first_window_mae_per_subject[subject_name] = float('nan')
 
 # -----------------------------
 # Main
@@ -829,6 +984,10 @@ def main():
                         help="Window length (in samples) for POS overlap-add (default 30 @ 30fps = 1s).")
     parser.add_argument("--use_cct", action="store_true",
                         help="Append CCT (correlated color temperature) as an extra input channel.")
+    parser.add_argument("--use_invariant", action="store_true",
+                        help="Append invariant channels as an extra input channel.")
+    parser.add_argument("--use_ch6", action="store_true",
+                        help="Append 6-channel transform as an extra input channel.")
     # ---- 新增參數 ----
     parser.add_argument("--model", type=str, default="tcn",
                         choices=["tcn", "rf", "svr"],
@@ -842,12 +1001,16 @@ def main():
                         help="One or more train CSV paths when --mode fixed")
     parser.add_argument("--test_csv", nargs='+', type=str, default=None,
                         help="One or more test CSV paths when --mode fixed")
-    parser.add_argument("--use_label_weights", action="store_true",
-                        help="啟用依 SpO2 分佈的加權 loss（訓練時）")
-    parser.add_argument("--weight_gamma", type=float, default=1.0,
-                        help="權重指數，>1 會更強化稀有區間；=1 為單純的反頻率")
+    parser.add_argument("--use_undersampling", action="store_true",
+                        help="啟用基於中位數的下採樣策略（訓練時）")
+    parser.add_argument("--use_denoising", action="store_true",
+                        help="啟用去噪處理（訓練時）")
     parser.add_argument("--save_predictions", action="store_true",
                         help="Save prediction results for visualization")
+    parser.add_argument("--enable_subject_plots", action="store_true",
+                        help="Enable subject-specific prediction plots")
+    parser.add_argument("--enable_first_window_mae", action="store_true",
+                        help="Enable first window MAE calculation")
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -864,6 +1027,7 @@ def main():
     test_list  = args.test_csv  if isinstance(args.test_csv, list)  else [args.test_csv]
 
     combo_rows = []
+    first_window_mae_rows = []  # 存儲第一個窗口 MAE 結果
     trained_models = {}  # 快取已訓練的模型
     
     for tr_path in train_list:
@@ -882,9 +1046,25 @@ def main():
                 continue
             
             print(f"[TESTING] {os.path.basename(tr_path)} -> {os.path.basename(te_path)}")
+            # 設置當前訓練檔案路徑，用於圖表檔名
+            args.current_train_path = tr_path
             row = evaluate_test_with_trained_model(model, train_info, te_path, args, device, args.test_normalization, args.save_predictions)
             row["train_csv"] = os.path.basename(tr_path)  # 補上訓練檔案名稱
             combo_rows.append(row)
+            
+            # 處理第一個窗口 MAE 結果（如果啟用）
+            if args.enable_first_window_mae and "first_window_mae_per_subject" in row:
+                first_window_mae_per_subject = row["first_window_mae_per_subject"]
+                # 計算所有受試者的平均第一個窗口 MAE
+                valid_maes = [mae for mae in first_window_mae_per_subject.values() if not np.isnan(mae)]
+                if valid_maes:
+                    avg_first_window_mae = np.mean(valid_maes)
+                    first_window_mae_rows.append({
+                        "train_csv": os.path.basename(tr_path),
+                        "test_csv": os.path.basename(te_path),
+                        "model": args.model,
+                        "avg_first_window_mae": float(avg_first_window_mae)
+                    })
 
     if len(combo_rows):
         df = pd.DataFrame(combo_rows)
@@ -999,6 +1179,43 @@ def main():
         plt.tight_layout()
         plt.savefig('fixed_combo_heatmap.png', dpi=300, bbox_inches='tight')
         print(f"Saved: fixed_combo_heatmap.png")
+    
+    # 處理第一個窗口 MAE 結果（如果啟用）
+    if args.enable_first_window_mae and len(first_window_mae_rows):
+        fw_mae_df = pd.DataFrame(first_window_mae_rows)
+        
+        # 生成第一個窗口 MAE 的 pivot table
+        fw_mae_pivot = fw_mae_df.pivot(index='train_csv', columns='test_csv', values='avg_first_window_mae')
+        
+        # 重置 index 名稱
+        fw_mae_pivot.index.name = 'train_file'
+        
+        # 儲存第一個窗口 MAE CSV 檔案
+        fw_mae_pivot.to_csv("first_window_mae_results.csv")
+        print(f"Saved: first_window_mae_results.csv")
+        
+        # 生成第一個窗口 MAE 熱圖
+        fw_mae_pivot_clean = fw_mae_pivot.copy()
+        
+        # 移除 columns 和 index 的 .csv 後綴
+        fw_mae_pivot_clean.columns = [col.replace('.csv', '') for col in fw_mae_pivot_clean.columns]
+        fw_mae_pivot_clean.index = [idx.replace('.csv', '') for idx in fw_mae_pivot_clean.index]
+        
+        # 創建第一個窗口 MAE 熱圖
+        plt.figure(figsize=(12, 8))
+        sns.heatmap(fw_mae_pivot_clean, annot=True, fmt='.2f', cmap='RdYlGn_r', 
+                    center=5.0, cbar_kws={'label': 'First Window MAE'},
+                    annot_kws={'fontsize': 8})
+        plt.title('First Window MAE Heatmap')
+        plt.xlabel('Test')
+        plt.ylabel('Train')
+        # 旋轉 x 軸標籤 45 度
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        
+        plt.tight_layout()
+        plt.savefig('first_window_mae_heatmap.png', dpi=300, bbox_inches='tight')
+        print(f"Saved: first_window_mae_heatmap.png")
 
 
 if __name__ == "__main__":

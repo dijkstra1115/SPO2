@@ -13,14 +13,6 @@
     "data/prc-s9180.csv"
   ],
   "test_csv": [
-    "data/hm1-c930.csv",
-    "data/hm1-i15.csv",
-    "data/hm1-i15m.csv",
-    "data/hm1-s9260.csv",
-    "data/hm1-s9280.csv",
-    "data/hm2-c930.csv",
-    "data/hm2-i15.csv",
-    "data/hm2-i15m.csv",
     "data/hm3-c930.csv",
     "data/hm3-i16.csv",
     "data/hm3-i16m.csv",
@@ -36,8 +28,13 @@
   "stride_sec": 2,
   "use_pos": false,
   "use_cct": false,
-  "use_label_weights": false,
+  "use_ch6": true,
+  "use_invariant": false,
+  "use_undersampling": false,
+  "use_denoising": false,
   "train_normalization": "cumulative",
   "test_normalization": "cumulative",
-  "save_predictions": true
+  "save_predictions": false,
+  "enable_first_window_mae": false,
+  "enable_subject_plots": false
 }

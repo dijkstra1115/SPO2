@@ -25,9 +25,9 @@ def build_command(config):
     # 預設值
     defaults = {
         "fps": 30,
-        "seq_sec": 1,
-        "stride_sec": 1,
-        "epochs": 40,
+        "seq_sec": 30,
+        "stride_sec": 2,
+        "epochs": 60,
         "patience": 10,
         "batch_size": 512,
         "hidden": 64,
@@ -45,8 +45,7 @@ def build_command(config):
         "svr_C": 1.0,
         "svr_gamma": "scale",
         "ema_alpha": 0.05,
-        "warmup_sec": 30,
-        "weight_gamma": 1.5
+        "warmup_sec": 30
     }
     
     # 基本參數
@@ -59,7 +58,7 @@ def build_command(config):
     # 模型參數（使用配置值或預設值）
     for param in ["fps", "seq_sec", "stride_sec", "epochs", "patience", "batch_size", 
                   "hidden", "levels", "kernel", "dropout", "lr", "seed", "device", "val_ratio",
-                  "ema_alpha", "warmup_sec", "weight_gamma"]:
+                  "ema_alpha", "warmup_sec"]:
         value = config.get(param, defaults[param])
         cmd.extend([f"--{param}", str(value)])
     
@@ -70,10 +69,20 @@ def build_command(config):
         cmd.extend(["--pos_win", str(pos_win)])
     if config.get("use_cct", False):
         cmd.append("--use_cct")
+    if config.get("use_invariant", False):
+        cmd.append("--use_invariant")
+    if config.get("use_ch6", False):
+        cmd.append("--use_ch6")
     if config.get("save_predictions", False):
         cmd.append("--save_predictions")
-    if config.get("use_label_weights", False):
-        cmd.append("--use_label_weights")
+    if config.get("use_undersampling", False):
+        cmd.append("--use_undersampling")
+    if config.get("use_denoising", False):
+        cmd.append("--use_denoising")
+    if config.get("enable_first_window_mae", False):
+        cmd.append("--enable_first_window_mae")
+    if config.get("enable_subject_plots", False):
+        cmd.append("--enable_subject_plots")
     
     # sklearn 模型參數
     if config["model"] == "rf":
