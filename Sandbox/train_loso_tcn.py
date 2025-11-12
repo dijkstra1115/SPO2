@@ -75,7 +75,7 @@ def getsixchannels(rgb: np.ndarray) -> List[np.ndarray]:
 def get_invariant_channels(rgb: np.ndarray) -> np.ndarray:
     """
     rgb: (3, N) 原始 0..255
-    return: (K, N) 追加的強度/白平衡更不敏感特徵
+    return: R_acdc, G_acdc, B_acdc
     """
     from scipy.signal import butter, filtfilt
     def butter_filter(sig, fs=30, cutoff=0.1, btype='low', order=3):
@@ -295,107 +295,6 @@ def build_windows_stride_frozen(
         return np.zeros((0, C, seq_len), dtype=np.float32), np.zeros((0,), dtype=np.float32)
     return np.stack(xs, axis=0), np.array(ys, dtype=np.float32)
 
-def bandpass_filter_rgb(rgb, fs=30.0, low_freq=0.7, high_freq=3.0, axis=-1):
-    """
-    對 RGB 信號應用帶通濾波器
-    rgb: ndarray，形狀可為 (..., n_samples) 或 (n_channels, n_samples) 等
-    fs: 取樣率
-    low_freq: 低頻截止 (Hz)
-    high_freq: 高頻截止 (Hz)
-    axis: 時間軸
-    """
-    from scipy.signal import butter, sosfiltfilt
-    
-    # 確保輸入是 numpy 數組
-    rgb = np.asarray(rgb, dtype=np.float64)
-    
-    # 設計帶通濾波器
-    nyq = 0.5 * fs
-    low = np.clip(low_freq / nyq, 1e-6, 0.999)
-    high = np.clip(high_freq / nyq, low + 1e-6, 0.999999)
-    
-    # 設計 5 階帶通濾波器
-    sos = butter(5, [low, high], btype='bandpass', output='sos')
-    
-    # 對每個通道應用帶通濾波器
-    def apply_bandpass_1d(sig_1d):
-        # 處理 NaN 值
-        if np.isnan(sig_1d).any():
-            n = len(sig_1d)
-            isnan = np.isnan(sig_1d)
-            if isnan.all():
-                return np.zeros_like(sig_1d)
-            idx = np.arange(n)
-            sig_1d = np.interp(idx, idx[~isnan], sig_1d[~isnan])
-        
-        # 應用帶通濾波器 (filtfilt 提供零相位延遲)
-        padlen = min(3 * 10, len(sig_1d) - 1) if len(sig_1d) > 1 else 0
-        return sosfiltfilt(sos, sig_1d, padlen=padlen)
-    
-    # 沿指定軸應用濾波器
-    x = np.moveaxis(rgb, axis, -1)
-    out = np.empty_like(x)
-    lead_shape = x.shape[:-1]
-    
-    for idx in np.ndindex(lead_shape):
-        out[idx] = apply_bandpass_1d(x[idx])
-    
-    return np.moveaxis(out, -1, axis).astype(np.float32)
-
-def savgol_filter_rgb(rgb, window_length=15, polyorder=3, axis=-1):
-    """
-    對 RGB 信號應用 Savitzky-Golay 濾波器
-    rgb: ndarray，形狀可為 (..., n_samples) 或 (n_channels, n_samples) 等
-    window_length: 濾波器窗口長度（必須是奇數）
-    polyorder: 多項式階數
-    axis: 時間軸
-    """
-    from scipy.signal import savgol_filter
-    
-    # 確保 window_length 是奇數
-    if window_length % 2 == 0:
-        window_length += 1
-    
-    # 確保 window_length 不超過信號長度
-    signal_length = rgb.shape[axis]
-    if window_length > signal_length:
-        window_length = signal_length if signal_length % 2 == 1 else signal_length - 1
-    
-    # 確保 polyorder 不超過 window_length - 1
-    polyorder = min(polyorder, window_length - 1)
-    
-    # 對每個通道應用 Savitzky-Golay 濾波器
-    x = np.moveaxis(rgb, axis, -1)
-    out = np.empty_like(x)
-    lead_shape = x.shape[:-1]
-    
-    for idx in np.ndindex(lead_shape):
-        out[idx] = savgol_filter(x[idx], window_length=window_length, polyorder=polyorder)
-    
-    return np.moveaxis(out, -1, axis)
-
-def simple_filter_pipeline(rgb, fs=30.0, 
-                          low_freq=0.7, high_freq=3.0,
-                          savgol_window=15, savgol_polyorder=3,
-                          axis=-1):
-    """
-    簡化的濾波管道：bandpass filter + Savitzky-Golay
-    rgb: ndarray，形狀可為 (..., n_samples) 或 (n_channels, n_samples) 等
-    fs: 取樣率
-    low_freq: 帶通濾波器低頻截止 (Hz)
-    high_freq: 帶通濾波器高頻截止 (Hz)
-    savgol_window: Savitzky-Golay 窗口長度
-    savgol_polyorder: Savitzky-Golay 多項式階數
-    axis: 時間軸
-    """
-    # 第一步：帶通濾波器
-    stage1 = bandpass_filter_rgb(rgb, fs=fs, low_freq=low_freq, high_freq=high_freq, axis=axis)
-    
-    # 第二步：Savitzky-Golay 濾波器
-    stage2 = savgol_filter_rgb(stage1, window_length=savgol_window, polyorder=savgol_polyorder, axis=axis)
-    
-    return stage2
-
 # -----------------------------
 # Dataset
 # -----------------------------
@@ -564,18 +463,6 @@ def prepare_subject_windows(
 
         rgb = np.vstack([R, G, B])
         chs = []
-
-        # 簡化濾波：bandpass filter + Savitzky-Golay
-        if args.use_denoising:
-            rgb_filtered = simple_filter_pipeline(
-                rgb, fs=fps,
-                low_freq=0.7,        # 帶通濾波器低頻截止 (Hz)
-                high_freq=3.0,      # 帶通濾波器高頻截止 (Hz)
-                savgol_window=15,   # Savitzky-Golay 窗口長度
-                savgol_polyorder=3,  # Savitzky-Golay 多項式階數
-                axis=-1
-            )
-            rgb = rgb_filtered
 
         # 6 通道
         if args.use_ch6:
@@ -1003,8 +890,6 @@ def main():
                         help="One or more test CSV paths when --mode fixed")
     parser.add_argument("--use_undersampling", action="store_true",
                         help="啟用基於中位數的下採樣策略（訓練時）")
-    parser.add_argument("--use_denoising", action="store_true",
-                        help="啟用去噪處理（訓練時）")
     parser.add_argument("--save_predictions", action="store_true",
                         help="Save prediction results for visualization")
     parser.add_argument("--enable_subject_plots", action="store_true",

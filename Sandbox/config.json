@@ -10,7 +10,12 @@
     "data/prc-i15.csv",
     "data/prc-i15m.csv",
     "data/prc-s9160.csv",
-    "data/prc-s9180.csv"
+    "data/prc-s9180.csv",
+    "data/prc2-c930.csv",
+    "data/prc2-i16.csv",
+    "data/prc2-i16m.csv",
+    "data/prc2-s9360.csv",
+    "data/prc2-s9380.csv"
   ],
   "test_csv": [
     "data/hm3-c930.csv",
@@ -22,16 +27,20 @@
     "data/prc-i15.csv",
     "data/prc-i15m.csv",
     "data/prc-s9160.csv",
-    "data/prc-s9180.csv"
+    "data/prc-s9180.csv",
+    "data/prc2-c930.csv",
+    "data/prc2-i16.csv",
+    "data/prc2-i16m.csv",
+    "data/prc2-s9360.csv",
+    "data/prc2-s9380.csv"
   ],
-  "seq_sec": 30,
-  "stride_sec": 2,
+  "seq_sec": 1,
+  "stride_sec": 1,
   "use_pos": false,
   "use_cct": false,
   "use_ch6": true,
   "use_invariant": false,
   "use_undersampling": false,
-  "use_denoising": false,
   "train_normalization": "cumulative",
   "test_normalization": "cumulative",
   "save_predictions": false,

@@ -77,8 +77,6 @@ def build_command(config):
         cmd.append("--save_predictions")
     if config.get("use_undersampling", False):
         cmd.append("--use_undersampling")
-    if config.get("use_denoising", False):
-        cmd.append("--use_denoising")
     if config.get("enable_first_window_mae", False):
         cmd.append("--enable_first_window_mae")
     if config.get("enable_subject_plots", False):

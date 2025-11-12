@@ -3,9 +3,9 @@ import numpy as np
 import os
 from typing import List, Optional
 
-DATA_DIR = "//169.254.2.1/Algorithm/HehuanMountain3_SPO2"
-DEVICE = "SM-S9380-Front"
-META_FILE = "Meta_oxygen.csv"
+DATA_DIR = "//169.254.2.1/Algorithm/PRC SpO2 (2025)"
+DEVICE = "C930"
+META_FILE = "meta.csv"
 SPO2_MIN = 70
 SPO2_MAX = 100
 IQA_MOTION_THRESHOLD = 0.9
@@ -30,7 +30,7 @@ def process_folder_data(folder_name: str, data_dir: str) -> Optional[List[pd.Dat
     """
     try:
         # 讀取 {DEVICE}.csv (RGB 資料 + IQA Motion)
-        dump_path = os.path.join(data_dir, "Dump", folder_name, f"{DEVICE}.csv")
+        dump_path = os.path.join(data_dir, "Dump(5.8.4)", folder_name, f"{DEVICE}.csv")
         dump_data = pd.read_csv(dump_path, usecols=["COLOR_R", "COLOR_G", "COLOR_B", "IQA Motion"])
         print(f"  - {DEVICE}.csv: {len(dump_data)} 偵")
         
