@@ -73,8 +73,6 @@ def build_command(config):
         cmd.append("--use_invariant")
     if config.get("use_ch6", False):
         cmd.append("--use_ch6")
-    if config.get("save_predictions", False):
-        cmd.append("--save_predictions")
     if config.get("use_undersampling", False):
         cmd.append("--use_undersampling")
     if config.get("enable_first_window_mae", False):

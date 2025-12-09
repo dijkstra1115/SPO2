@@ -17,6 +17,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import r2_score
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.svm import SVR
+from sklearn.model_selection import KFold
 
 # -----------------------------
 # Utils
@@ -522,10 +523,29 @@ def prepare_subject_windows(
 # -----------------------------
 # Fixed-mode utilities
 # -----------------------------
-def train_model_once(train_path: str, args, device, train_normalization: str = None) -> Tuple[any, Dict[str, any]]:
-    """訓練一次模型，返回模型和訓練資料資訊"""
+def train_model_once(train_data, args, device, train_normalization: str = None, train_name: str = None) -> Tuple[any, Dict[str, any]]:
+    """
+    訓練一次模型，返回模型和訓練資料資訊
+    
+    Args:
+        train_data: 可以是 CSV 路徑字符串或 DataFrame
+        args: 參數對象
+        device: 設備
+        train_normalization: 訓練時的標準化方式
+        train_name: 訓練數據的名稱（用於日誌），如果為 None 則從 train_data 推斷
+    """
     expected_cols = {"Folder","COLOR_R","COLOR_G","COLOR_B","SPO2"}
-    df_tr = pd.read_csv(train_path)
+    
+    # 支持 DataFrame 或路徑字符串
+    if isinstance(train_data, pd.DataFrame):
+        df_tr = train_data
+        train_path_display = train_name or "DataFrame"
+    elif isinstance(train_data, str):
+        df_tr = pd.read_csv(train_data)
+        train_path_display = train_name or os.path.basename(train_data)
+    else:
+        raise ValueError("train_data must be a DataFrame or a path string")
+    
     if not expected_cols.issubset(df_tr.columns):
         raise ValueError(f"CSV must contain columns: {expected_cols}")
 
@@ -590,7 +610,7 @@ def train_model_once(train_path: str, args, device, train_normalization: str = N
                 bad = 0
             else:
                 bad += 1
-            print(f"[TRAIN][TCN][{os.path.basename(train_path)}] "
+            print(f"[TRAIN][TCN][{train_path_display}] "
                   f"Epoch {ep:03d} | train MSE:{tr_loss:.4f} | val R2:{r2_va:.3f} MAE:{mae_va:.2f} RMSE:{rmse_va:.2f}")
             if bad >= patience:
                 print("[TRAIN][TCN] Early stopping."); break
@@ -629,15 +649,38 @@ def train_model_once(train_path: str, args, device, train_normalization: str = N
         rmse_va = math.sqrt(((y_pred_va - yva) ** 2).mean())
         mae_va = np.abs(y_pred_va - yva).mean()
         r2_va = r2_score(yva, y_pred_va)
-        print(f"[TRAIN][{args.model.upper()}][{os.path.basename(train_path)}] "
+        print(f"[TRAIN][{args.model.upper()}][{train_path_display}] "
               f"val R2:{r2_va:.3f} MAE:{mae_va:.2f} RMSE:{rmse_va:.2f}")
         
         return model, train_info
 
-def evaluate_test_with_trained_model(model, train_info: Dict[str, any], test_path: str, args, device, test_normalization: str = None, save_predictions: bool = False) -> Dict[str, float]:
-    """使用已訓練的模型評估測試集"""
+def evaluate_test_with_trained_model(model, train_info: Dict[str, any], test_data, args, device, test_normalization: str = None, save_predictions: bool = False, test_name: str = None, train_name: str = None) -> Dict[str, float]:
+    """
+    使用已訓練的模型評估測試集
+    
+    Args:
+        model: 已訓練的模型
+        train_info: 訓練資料資訊
+        test_data: 可以是 CSV 路徑字符串或 DataFrame
+        args: 參數對象
+        device: 設備
+        test_normalization: 測試時的標準化方式
+        save_predictions: 是否保存預測結果
+        test_name: 測試數據的名稱（用於日誌），如果為 None 則從 test_data 推斷
+        train_name: 訓練數據的名稱（用於圖表檔名）
+    """
     expected_cols = {"Folder","COLOR_R","COLOR_G","COLOR_B","SPO2"}
-    df_te = pd.read_csv(test_path)
+    
+    # 支持 DataFrame 或路徑字符串
+    if isinstance(test_data, pd.DataFrame):
+        df_te = test_data
+        test_path_display = test_name or "DataFrame"
+    elif isinstance(test_data, str):
+        df_te = pd.read_csv(test_data)
+        test_path_display = test_name or os.path.basename(test_data)
+    else:
+        raise ValueError("test_data must be a DataFrame or a path string")
+    
     if not expected_cols.issubset(df_te.columns):
         raise ValueError(f"CSV must contain columns: {expected_cols}")
 
@@ -653,7 +696,7 @@ def evaluate_test_with_trained_model(model, train_info: Dict[str, any], test_pat
     y_test = np.concatenate([v[1] for v in subj_te.values()], axis=0)
 
     result_row = {
-        "test_csv": os.path.basename(test_path),
+        "test_csv": test_path_display,
         "model": args.model,
     }
     
@@ -661,8 +704,10 @@ def evaluate_test_with_trained_model(model, train_info: Dict[str, any], test_pat
     first_window_mae_per_subject = {}
 
     # 獲取訓練檔案名稱（用於圖表檔名）
-    train_file_name = os.path.basename(getattr(args, 'current_train_path', 'unknown'))
-    test_file_name = os.path.basename(test_path)
+    train_file_name = train_name or getattr(args, 'current_train_path', 'unknown')
+    if isinstance(train_file_name, str) and os.path.exists(train_file_name):
+        train_file_name = os.path.basename(train_file_name)
+    test_file_name = test_path_display
     
     # 創建按 train_test 分組的圖表保存目錄
     train_base = train_file_name.replace('.csv', '')
@@ -675,7 +720,7 @@ def evaluate_test_with_trained_model(model, train_info: Dict[str, any], test_pat
         te_loader = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
         
         r2_te, mae_te, rmse_te, y_pred_te = eval_one(model, te_loader, device)
-        print(f"[TEST][TCN][{os.path.basename(test_path)}] "
+        print(f"[TEST][TCN][{test_path_display}] "
               f"R2={r2_te:.3f} | MAE={mae_te:.2f} | RMSE={rmse_te:.2f}")
         result_row.update({"R2": float(r2_te), "MAE": float(mae_te)})
         
@@ -707,7 +752,7 @@ def evaluate_test_with_trained_model(model, train_info: Dict[str, any], test_pat
         rmse_te = math.sqrt(((y_pred_te - yte) ** 2).mean())
         mae_te = np.abs(y_pred_te - yte).mean()
         r2_te = r2_score(yte, y_pred_te)
-        print(f"[TEST][{args.model.upper()}][{os.path.basename(test_path)}] "
+        print(f"[TEST][{args.model.upper()}][{test_path_display}] "
               f"R2={r2_te:.3f} | MAE={mae_te:.2f} | RMSE={rmse_te:.2f}")
         result_row.update({"R2": float(r2_te), "MAE": float(mae_te)})
         
@@ -802,6 +847,37 @@ def _plot_subject_predictions(subj_te: Dict[str, Tuple[np.ndarray, np.ndarray]],
         
         print(f"[PLOT] Saved: {plot_path}")
 
+def _run_single_fold(df_train_fold: pd.DataFrame, df_test_fold: pd.DataFrame, 
+                     fold_idx: int, args, device) -> Tuple[any, np.ndarray, np.ndarray]:
+    """
+    運行單個 fold 的訓練和測試
+    
+    Returns:
+        (model, y_test, y_pred_te): 模型、真實值、預測值
+    """
+    # 訓練模型
+    train_name = f"Fold{fold_idx}_train"
+    model, train_info = train_model_once(
+        df_train_fold, args, device, 
+        train_normalization=args.train_normalization,
+        train_name=train_name
+    )
+    
+    # 測試模型
+    test_name = f"Fold{fold_idx}_test"
+    result = evaluate_test_with_trained_model(
+        model, train_info, df_test_fold, args, device,
+        test_normalization=args.test_normalization,
+        save_predictions=True,
+        test_name=test_name,
+        train_name=train_name
+    )
+    
+    y_test = result.get("y_true", np.array([]))
+    y_pred_te = result.get("y_pred", np.array([]))
+    
+    return model, y_test, y_pred_te
+
 def _calculate_first_window_mae(subj_te: Dict[str, Tuple[np.ndarray, np.ndarray]], 
                                y_pred_te: np.ndarray, 
                                first_window_mae_per_subject: Dict[str, float]) -> None:
@@ -833,6 +909,259 @@ def _calculate_first_window_mae(subj_te: Dict[str, Tuple[np.ndarray, np.ndarray]
             first_window_mae_per_subject[subject_name] = float(first_window_mae)
         else:
             first_window_mae_per_subject[subject_name] = float('nan')
+
+# -----------------------------
+# Subject ID extraction
+# -----------------------------
+def extract_subject_prefix(folder_name: str) -> str:
+    """
+    從 Folder 名稱中提取受試者前綴 ID
+    
+    例如: '[S093-2]_seq1' -> 'S093-2'
+    
+    Args:
+        folder_name: Folder 名稱，格式為 '[ID]_seqX'
+    
+    Returns:
+        受試者前綴 ID（去掉方括號）
+    """
+    # 提取方括號內的內容（去掉方括號）
+    if folder_name.startswith('[') and ']' in folder_name:
+        end_bracket = folder_name.index(']')
+        prefix = folder_name[1:end_bracket]  # 去掉開頭的 '[' 和結尾的 ']'
+        return prefix
+    # 如果沒有方括號，嘗試直接提取下劃線前的部分
+    elif '_' in folder_name:
+        return folder_name.split('_')[0]
+    else:
+        # 如果都沒有，返回原值
+        return folder_name
+
+# -----------------------------
+# Result saving and visualization
+# -----------------------------
+def _save_cv_results(combo_rows: List[Dict], first_window_mae_rows: List[Dict] = None):
+    """保存交叉驗證結果到 CSV 和生成熱圖"""
+    if len(combo_rows) == 0:
+        return
+    
+    import matplotlib
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from matplotlib.colors import TwoSlopeNorm
+    
+    # 設定中文字體
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+    
+    # 定義 colorbar 刻度格式化函數
+    def format_colorbar_tick(value):
+        return f"{value:.2f}" if -1 < value < 1 else f"{int(value)}"
+    
+    # 保存詳細結果（包含 fold 詳情）
+    df_full = pd.DataFrame(combo_rows)
+    df_full.to_csv("10fold_cv_detailed_results.csv", index=False)
+    print(f"\nSaved: 10fold_cv_detailed_results.csv (包含每個 fold 的詳細結果)")
+    
+    # 保存按 SPO2 範圍分組的結果
+    range_rows = []
+    for row in combo_rows:
+        if "range_details" in row and row["range_details"]:
+            range_rows.extend(row["range_details"])
+    
+    if len(range_rows) > 0:
+        df_ranges = pd.DataFrame(range_rows)
+        df_ranges.to_csv("10fold_cv_spo2_range_results.csv", index=False)
+        print(f"Saved: 10fold_cv_spo2_range_results.csv (按 SPO2 範圍分組的統計結果)")
+        
+        # 為每個 SPO2 範圍生成熱圖
+        spo2_ranges = ["[70, 80)", "[80, 90)", "[90, 100]"]
+        for range_label in spo2_ranges:
+            df_range = df_ranges[df_ranges['spo2_range'] == range_label].copy()
+            
+            if len(df_range) > 0:
+                # 創建 R² 和 MAE 的 pivot table
+                r2_range_pivot = df_range.pivot(index='train_csv', columns='test_csv', values='R2')
+                mae_range_pivot = df_range.pivot(index='train_csv', columns='test_csv', values='MAE')
+                
+                # 重置 index 名稱
+                r2_range_pivot.index.name = 'train_file'
+                mae_range_pivot.index.name = 'train_file'
+                
+                # 移除 .csv 後綴
+                r2_range_pivot_clean = r2_range_pivot.copy()
+                mae_range_pivot_clean = mae_range_pivot.copy()
+                r2_range_pivot_clean.columns = [col.replace('.csv', '') for col in r2_range_pivot_clean.columns]
+                mae_range_pivot_clean.columns = [col.replace('.csv', '') for col in mae_range_pivot_clean.columns]
+                r2_range_pivot_clean.index = [idx.replace('.csv', '') for idx in r2_range_pivot_clean.index]
+                mae_range_pivot_clean.index = [idx.replace('.csv', '') for idx in mae_range_pivot_clean.index]
+                
+                # 創建子圖
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+                
+                # R² 熱圖
+                r2_range_vals = r2_range_pivot_clean.values.astype(float)
+                vmin_r2 = np.nanmin(r2_range_vals)
+                vmax_r2 = np.nanmax(r2_range_vals)
+                
+                if not (vmin_r2 < 0 < vmax_r2):
+                    vmin_r2 = min(vmin_r2, -1e-6)
+                    vmax_r2 = max(vmax_r2, 1e-6)
+                
+                norm_r2 = TwoSlopeNorm(vmin=vmin_r2, vcenter=0.0, vmax=vmax_r2)
+                
+                neg_ticks_r2 = np.arange(np.floor(vmin_r2/10)*10, 0, 10)
+                pos_step_r2 = 0.05 if vmax_r2 <= 1 else vmax_r2/4
+                pos_ticks_r2 = np.arange(0, vmax_r2 + 1e-9, pos_step_r2) if vmax_r2 > 0 else np.array([0.0])
+                ticks_r2 = np.unique(np.concatenate([neg_ticks_r2, [0.0], pos_ticks_r2]))
+                
+                sns.heatmap(
+                    r2_range_pivot_clean, annot=True, fmt='.2f',
+                    cmap='RdYlGn', norm=norm_r2, mask=np.isnan(r2_range_vals),
+                    ax=ax1,
+                    cbar_kws={'label': 'R²', 'ticks': ticks_r2, 'format': matplotlib.ticker.FuncFormatter(lambda x, pos: format_colorbar_tick(x))},
+                    annot_kws={'fontsize': 8}
+                )
+                ax1.set_title(f'R² Heatmap - {range_label}')
+                ax1.set_xlabel('Test')
+                ax1.set_ylabel('Train')
+                ax1.set_xticklabels(ax1.get_xticklabels(), rotation=45, ha='right')
+                ax1.set_yticklabels(ax1.get_yticklabels(), rotation=0)
+                
+                # MAE 熱圖
+                sns.heatmap(mae_range_pivot_clean, annot=True, fmt='.1f', cmap='RdYlGn_r', 
+                            center=10.0, ax=ax2, cbar_kws={'label': 'MAE'},
+                            annot_kws={'fontsize': 8})
+                ax2.set_title(f'MAE Heatmap - {range_label}')
+                ax2.set_xlabel('Test')
+                ax2.set_ylabel('Train')
+                ax2.set_xticklabels(ax2.get_xticklabels(), rotation=45, ha='right')
+                ax2.set_yticklabels(ax2.get_yticklabels(), rotation=0)
+                
+                plt.tight_layout()
+                # 文件名：將範圍標籤轉換為文件名友好的格式
+                range_filename = range_label.replace('[', '').replace(']', '').replace(')', '').replace(', ', '_')
+                filename = f'10fold_cv_heatmap_{range_filename}.png'
+                plt.savefig(filename, dpi=300, bbox_inches='tight')
+                plt.close()
+                print(f"Saved: {filename}")
+    
+    # 創建簡化版本用於 pivot（只保留主要指標）
+    df_simple = df_full[['train_csv', 'test_csv', 'model', 'R2', 'MAE', 'RMSE', 'n_samples', 'n_folds']].copy()
+    
+    # 分別產出 R2 和 MAE 的 CSV
+    r2_pivot = df_simple.pivot(index='train_csv', columns='test_csv', values='R2')
+    mae_pivot = df_simple.pivot(index='train_csv', columns='test_csv', values='MAE')
+    
+    # 重置 index 名稱
+    r2_pivot.index.name = 'train_file'
+    mae_pivot.index.name = 'train_file'
+    
+    # 儲存 CSV 檔案
+    r2_pivot.to_csv("10fold_cv_results_R2.csv")
+    mae_pivot.to_csv("10fold_cv_results_MAE.csv")
+    
+    print(f"Saved: 10fold_cv_results_R2.csv")
+    print(f"Saved: 10fold_cv_results_MAE.csv")
+    
+    # 處理欄位名稱：移除 .csv 後綴
+    r2_pivot_clean = r2_pivot.copy()
+    mae_pivot_clean = mae_pivot.copy()
+    
+    # 移除 columns 的 .csv 後綴
+    r2_pivot_clean.columns = [col.replace('.csv', '') for col in r2_pivot_clean.columns]
+    mae_pivot_clean.columns = [col.replace('.csv', '') for col in mae_pivot_clean.columns]
+    
+    # 移除 index 的 .csv 後綴
+    r2_pivot_clean.index = [idx.replace('.csv', '') for idx in r2_pivot_clean.index]
+    mae_pivot_clean.index = [idx.replace('.csv', '') for idx in mae_pivot_clean.index]
+    
+    # 創建子圖
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+
+    r2_vals = r2_pivot_clean.values.astype(float)
+
+    # 忽略 NaN 取 min/max
+    vmin = np.nanmin(r2_vals)
+    vmax = np.nanmax(r2_vals)
+
+    if not (vmin < 0 < vmax):
+        vmin = min(vmin, -1e-6)
+        vmax = max(vmax,  1e-6)
+
+    norm = TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
+
+    # ---- 自訂 colorbar 刻度 ----
+    neg_ticks = np.arange(np.floor(vmin/10)*10, 0, 10)
+    pos_step = 0.05 if vmax <= 1 else vmax/4
+    pos_ticks = np.arange(0, vmax + 1e-9, pos_step) if vmax > 0 else np.array([0.0])
+    ticks = np.unique(np.concatenate([neg_ticks, [0.0], pos_ticks]))
+
+    sns.heatmap(
+        r2_pivot_clean, annot=True, fmt='.2f',
+        cmap='RdYlGn', norm=norm, mask=np.isnan(r2_vals),
+        ax=ax1,
+        cbar_kws={'label': 'R²', 'ticks': ticks, 'format': matplotlib.ticker.FuncFormatter(lambda x, pos: format_colorbar_tick(x))},
+        annot_kws={'fontsize': 8}
+    )
+    ax1.set_title('R² Heatmap')
+    ax1.set_xlabel('Test')
+    ax1.set_ylabel('Train')
+    # 旋轉 x 軸標籤 45 度
+    ax1.set_xticklabels(ax1.get_xticklabels(), rotation=45, ha='right')
+    ax1.set_yticklabels(ax1.get_yticklabels(), rotation=0)
+    
+    # MAE 熱圖 - 修復顯示問題
+    sns.heatmap(mae_pivot_clean, annot=True, fmt='.1f', cmap='RdYlGn_r', 
+                center=10.0, ax=ax2, cbar_kws={'label': 'MAE'},
+                annot_kws={'fontsize': 8})
+    ax2.set_title('MAE Heatmap')
+    ax2.set_xlabel('Test')
+    ax2.set_ylabel('Train')
+    # 旋轉 x 軸標籤 45 度
+    ax2.set_xticklabels(ax2.get_xticklabels(), rotation=45, ha='right')
+    ax2.set_yticklabels(ax2.get_yticklabels(), rotation=0)
+    
+    plt.tight_layout()
+    plt.savefig('10fold_cv_heatmap.png', dpi=300, bbox_inches='tight')
+    print(f"Saved: 10fold_cv_heatmap.png")
+    
+    # 處理第一個窗口 MAE（如果有的話）
+    if first_window_mae_rows and len(first_window_mae_rows):
+        fw_mae_df = pd.DataFrame(first_window_mae_rows)
+        
+        # 生成第一個窗口 MAE 的 pivot table
+        fw_mae_pivot = fw_mae_df.pivot(index='train_csv', columns='test_csv', values='avg_first_window_mae')
+        
+        # 重置 index 名稱
+        fw_mae_pivot.index.name = 'train_file'
+        
+        # 儲存第一個窗口 MAE CSV 檔案
+        fw_mae_pivot.to_csv("first_window_mae_results.csv")
+        print(f"Saved: first_window_mae_results.csv")
+        
+        # 生成第一個窗口 MAE 熱圖
+        fw_mae_pivot_clean = fw_mae_pivot.copy()
+        
+        # 移除 columns 和 index 的 .csv 後綴
+        fw_mae_pivot_clean.columns = [col.replace('.csv', '') for col in fw_mae_pivot_clean.columns]
+        fw_mae_pivot_clean.index = [idx.replace('.csv', '') for idx in fw_mae_pivot_clean.index]
+        
+        # 創建第一個窗口 MAE 熱圖
+        plt.figure(figsize=(12, 8))
+        sns.heatmap(fw_mae_pivot_clean, annot=True, fmt='.2f', cmap='RdYlGn_r', 
+                    center=5.0, cbar_kws={'label': 'First Window MAE'},
+                    annot_kws={'fontsize': 8})
+        plt.title('First Window MAE Heatmap')
+        plt.xlabel('Test')
+        plt.ylabel('Train')
+        # 旋轉 x 軸標籤 45 度
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        
+        plt.tight_layout()
+        plt.savefig('first_window_mae_heatmap.png', dpi=300, bbox_inches='tight')
+        print(f"Saved: first_window_mae_heatmap.png")
 
 # -----------------------------
 # Main
@@ -890,8 +1219,6 @@ def main():
                         help="One or more test CSV paths when --mode fixed")
     parser.add_argument("--use_undersampling", action="store_true",
                         help="啟用基於中位數的下採樣策略（訓練時）")
-    parser.add_argument("--save_predictions", action="store_true",
-                        help="Save prediction results for visualization")
     parser.add_argument("--enable_subject_plots", action="store_true",
                         help="Enable subject-specific prediction plots")
     parser.add_argument("--enable_first_window_mae", action="store_true",
@@ -903,9 +1230,9 @@ def main():
     device = torch.device(args.device)
     print(f"Training Device: {args.device}")
 
-    # --------- FIXED: 優化版本 - 相同訓練集只訓練一次 ---------
+    # --------- 10-FOLD CROSS-VALIDATION: 以受試者為單位分割 ---------
     if not args.train_csv or not args.test_csv:
-        raise ValueError("When --mode fixed, please provide --train_csv and --test_csv.")
+        raise ValueError("Please provide --train_csv and --test_csv.")
 
     # argparse 使用 nargs='+' 時會是 list；保險處理單一路徑字串
     train_list = args.train_csv if isinstance(args.train_csv, list) else [args.train_csv]
@@ -913,194 +1240,182 @@ def main():
 
     combo_rows = []
     first_window_mae_rows = []  # 存儲第一個窗口 MAE 結果
-    trained_models = {}  # 快取已訓練的模型
     
     for tr_path in train_list:
-        if tr_path not in trained_models:
-            print(f"\n[TRAINING] {os.path.basename(tr_path)}")
-            model, train_info = train_model_once(tr_path, args, device, args.train_normalization)
-            trained_models[tr_path] = (model, train_info)
-        else:
-            print(f"\n[REUSING] {os.path.basename(tr_path)}")
-            model, train_info = trained_models[tr_path]
-        
         for te_path in test_list:
-            # 跳過相同的訓練和測試檔案（避免資料洩漏）
-            if tr_path == te_path:
-                print(f"[SKIP] {os.path.basename(tr_path)} -> {os.path.basename(te_path)} (相同檔案，跳過)")
-                continue
+            print(f"\n{'='*80}")
+            print(f"[10-FOLD CV] Train: {os.path.basename(tr_path)} -> Test: {os.path.basename(te_path)}")
+            print(f"{'='*80}")
             
-            print(f"[TESTING] {os.path.basename(tr_path)} -> {os.path.basename(te_path)}")
-            # 設置當前訓練檔案路徑，用於圖表檔名
-            args.current_train_path = tr_path
-            row = evaluate_test_with_trained_model(model, train_info, te_path, args, device, args.test_normalization, args.save_predictions)
-            row["train_csv"] = os.path.basename(tr_path)  # 補上訓練檔案名稱
-            combo_rows.append(row)
+            # 1. 讀取 test_csv，提取所有受試者
+            expected_cols = {"Folder","COLOR_R","COLOR_G","COLOR_B","SPO2"}
+            df_train_full = pd.read_csv(tr_path)
+            df_test_full = pd.read_csv(te_path)
             
-            # 處理第一個窗口 MAE 結果（如果啟用）
-            if args.enable_first_window_mae and "first_window_mae_per_subject" in row:
-                first_window_mae_per_subject = row["first_window_mae_per_subject"]
-                # 計算所有受試者的平均第一個窗口 MAE
-                valid_maes = [mae for mae in first_window_mae_per_subject.values() if not np.isnan(mae)]
-                if valid_maes:
-                    avg_first_window_mae = np.mean(valid_maes)
-                    first_window_mae_rows.append({
-                        "train_csv": os.path.basename(tr_path),
-                        "test_csv": os.path.basename(te_path),
-                        "model": args.model,
-                        "avg_first_window_mae": float(avg_first_window_mae)
-                    })
-
-    if len(combo_rows):
-        df = pd.DataFrame(combo_rows)
-        
-        # 分別產出 R2 和 MAE 的 CSV
-        r2_pivot = df.pivot(index='train_csv', columns='test_csv', values='R2')
-        mae_pivot = df.pivot(index='train_csv', columns='test_csv', values='MAE')
-        
-        # 重置 index 名稱
-        r2_pivot.index.name = 'train_file'
-        mae_pivot.index.name = 'train_file'
-        
-        # 儲存 CSV 檔案
-        r2_pivot.to_csv("fixed_combo_results_R2.csv")
-        mae_pivot.to_csv("fixed_combo_results_MAE.csv")
-        
-        print(f"\nSaved: fixed_combo_results_R2.csv")
-        print(f"Saved: fixed_combo_results_MAE.csv")
-        
-        # 保存預測結果（如果啟用）
-        if args.save_predictions:
-            predictions_data = []
-            for _, row in df.iterrows():
-                if 'y_true' in row and 'y_pred' in row:
-                    y_true = row['y_true']
-                    y_pred = row['y_pred']
-                    for i in range(len(y_true)):
-                        predictions_data.append({
-                            'train_file': row['train_csv'],
-                            'test_file': row['test_csv'],
-                            'model': row['model'],
-                            'true_label': y_true[i],
-                            'prediction': y_pred[i]
+            if not expected_cols.issubset(df_train_full.columns) or not expected_cols.issubset(df_test_full.columns):
+                raise ValueError(f"CSV must contain columns: {expected_cols}")
+            
+            # 為 train 和 test 添加前綴 ID 列
+            df_train_full['subject_prefix'] = df_train_full["Folder"].apply(extract_subject_prefix)
+            df_test_full['subject_prefix'] = df_test_full["Folder"].apply(extract_subject_prefix)
+            
+            # 提取測試集中的所有唯一前綴 ID（用於 KFold 分割）
+            unique_test_prefixes = df_test_full["subject_prefix"].unique()
+            
+            print(f"[INFO] 測試集共有 {len(unique_test_prefixes)} 個不同的受試者前綴 ID")
+            print(f"[INFO] 受試者前綴 ID 列表: {unique_test_prefixes}")
+            
+            # 2. 10-fold 分割受試者（基於前綴 ID）
+            kf = KFold(n_splits=10, shuffle=True, random_state=args.seed)
+            
+            # 收集所有 fold 的預測結果
+            all_y_true = []
+            all_y_pred = []
+            fold_results = []
+            
+            for fold_idx, (_, test_prefix_indices) in enumerate(kf.split(unique_test_prefixes), 1):
+                print(f"\n{'-'*60}")
+                print(f"[FOLD {fold_idx}/10]")
+                print(f"{'-'*60}")
+                
+                # 該 fold 的測試受試者前綴 ID
+                fold_test_prefixes = unique_test_prefixes[test_prefix_indices]
+                print(f"[FOLD {fold_idx}] 測試受試者前綴 ID ({len(fold_test_prefixes)}): {fold_test_prefixes}")
+                
+                # 找出所有屬於這些前綴 ID 的完整 Folder 名稱
+                fold_test_folders = df_test_full[df_test_full["subject_prefix"].isin(fold_test_prefixes)]["Folder"].unique()
+                print(f"[FOLD {fold_idx}] 對應的完整 Folder 名稱 ({len(fold_test_folders)}): {fold_test_folders}")
+                
+                # 3. 從 train 中移除這些測試受試者的資料（基於前綴 ID）
+                train_mask = ~df_train_full["subject_prefix"].isin(fold_test_prefixes)
+                df_train_fold = df_train_full[train_mask].copy()
+                
+                removed_count = len(df_train_full) - len(df_train_fold)
+                print(f"[FOLD {fold_idx}] 從訓練集移除 {removed_count} 筆資料（屬於測試受試者前綴 ID）")
+                print(f"[FOLD {fold_idx}] 訓練集剩餘: {len(df_train_fold)} 筆資料")
+                
+                # 4. 從 test 中只保留該 fold 的受試者資料（基於前綴 ID）
+                test_mask = df_test_full["subject_prefix"].isin(fold_test_prefixes)
+                df_test_fold = df_test_full[test_mask].copy()
+                
+                print(f"[FOLD {fold_idx}] 測試集包含: {len(df_test_fold)} 筆資料")
+                
+                # 5. 訓練和測試模型（使用輔助函數）
+                try:
+                    model, y_test, y_pred_te = _run_single_fold(df_train_fold, df_test_fold, fold_idx, args, device)
+                    
+                    # 計算評估指標
+                    rmse_te = math.sqrt(((y_pred_te - y_test) ** 2).mean())
+                    mae_te = np.abs(y_pred_te - y_test).mean()
+                    r2_te = r2_score(y_test, y_pred_te)
+                    
+                    print(f"[FOLD {fold_idx}] R2={r2_te:.3f} | MAE={mae_te:.2f} | RMSE={rmse_te:.2f} | 測試樣本數={len(y_test)}")
+                except ValueError as e:
+                    print(f"[FOLD {fold_idx}] 警告：{e}，跳過此 fold")
+                    continue
+                
+                # 8. 收集預測結果
+                all_y_true.append(y_test)
+                all_y_pred.append(y_pred_te)
+                
+                fold_results.append({
+                    "fold": fold_idx,
+                    "n_samples": len(y_test),
+                    "r2": float(r2_te),
+                    "mae": float(mae_te),
+                    "rmse": float(rmse_te)
+                })
+            
+            # 9. 計算 micro-MAE（將所有 fold 的結果串接後計算）
+            if len(all_y_true) > 0:
+                all_y_true_concat = np.concatenate(all_y_true)
+                all_y_pred_concat = np.concatenate(all_y_pred)
+                
+                micro_mae = np.abs(all_y_pred_concat - all_y_true_concat).mean()
+                micro_rmse = math.sqrt(((all_y_pred_concat - all_y_true_concat) ** 2).mean())
+                micro_r2 = r2_score(all_y_true_concat, all_y_pred_concat)
+                
+                print(f"\n{'='*60}")
+                print(f"[10-FOLD CV 總結]")
+                print(f"{'='*60}")
+                print(f"Train: {os.path.basename(tr_path)}")
+                print(f"Test:  {os.path.basename(te_path)}")
+                print(f"總測試樣本數: {len(all_y_true_concat)}")
+                print(f"Micro-R²:   {micro_r2:.3f}")
+                print(f"Micro-MAE:  {micro_mae:.2f}")
+                print(f"Micro-RMSE: {micro_rmse:.2f}")
+                print(f"{'='*60}\n")
+                
+                # 10. 按 SPO2 範圍分組計算 MAE 和 R2
+                spo2_ranges = [
+                    (70, 80, "[70, 80)"),
+                    (80, 90, "[80, 90)"),
+                    (90, 100, "[90, 100]")
+                ]
+                
+                range_results = []
+                print(f"{'='*60}")
+                print(f"[按 SPO2 範圍分組統計]")
+                print(f"{'='*60}")
+                print(f"{'範圍':<12} {'樣本數':<10} {'MAE':<10} {'R²':<10}")
+                print(f"{'-'*60}")
+                
+                for low, high, range_label in spo2_ranges:
+                    if low == 90:
+                        # [90, 100] 包含 100
+                        mask = (all_y_true_concat >= low) & (all_y_true_concat <= high)
+                    else:
+                        # [70, 80) 和 [80, 90) 不包含上界
+                        mask = (all_y_true_concat >= low) & (all_y_true_concat < high)
+                    
+                    if np.sum(mask) > 0:
+                        y_true_range = all_y_true_concat[mask]
+                        y_pred_range = all_y_pred_concat[mask]
+                        
+                        mae_range = np.abs(y_pred_range - y_true_range).mean()
+                        r2_range = r2_score(y_true_range, y_pred_range)
+                        n_samples_range = len(y_true_range)
+                        
+                        print(f"{range_label:<12} {n_samples_range:<10} {mae_range:<10.2f} {r2_range:<10.3f}")
+                        
+                        range_results.append({
+                            "train_csv": os.path.basename(tr_path),
+                            "test_csv": os.path.basename(te_path),
+                            "model": args.model,
+                            "spo2_range": range_label,
+                            "n_samples": n_samples_range,
+                            "MAE": float(mae_range),
+                            "R2": float(r2_range)
                         })
-            
-            if predictions_data:
-                predictions_df = pd.DataFrame(predictions_data)
-                predictions_df.to_csv('predictions_results.csv', index=False)
-                print(f"Saved: predictions_results.csv")
-        
+                    else:
+                        print(f"{range_label:<12} {0:<10} {'N/A':<10} {'N/A':<10}")
+                        range_results.append({
+                            "train_csv": os.path.basename(tr_path),
+                            "test_csv": os.path.basename(te_path),
+                            "model": args.model,
+                            "spo2_range": range_label,
+                            "n_samples": 0,
+                            "MAE": float('nan'),
+                            "R2": float('nan')
+                        })
+                
+                print(f"{'='*60}\n")
+                
+                combo_rows.append({
+                    "train_csv": os.path.basename(tr_path),
+                    "test_csv": os.path.basename(te_path),
+                    "model": args.model,
+                    "R2": float(micro_r2),
+                    "MAE": float(micro_mae),
+                    "RMSE": float(micro_rmse),
+                    "n_samples": len(all_y_true_concat),
+                    "n_folds": len(fold_results),
+                    "fold_details": fold_results,
+                    "range_details": range_results
+                })
 
-        import matplotlib
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        from matplotlib.colors import TwoSlopeNorm
-        
-        # 設定中文字體
-        plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
-        plt.rcParams['axes.unicode_minus'] = False
-        
-        # 處理欄位名稱：移除 .csv 後綴
-        r2_pivot_clean = r2_pivot.copy()
-        mae_pivot_clean = mae_pivot.copy()
-        
-        # 移除 columns 的 .csv 後綴
-        r2_pivot_clean.columns = [col.replace('.csv', '') for col in r2_pivot_clean.columns]
-        mae_pivot_clean.columns = [col.replace('.csv', '') for col in mae_pivot_clean.columns]
-        
-        # 移除 index 的 .csv 後綴
-        r2_pivot_clean.index = [idx.replace('.csv', '') for idx in r2_pivot_clean.index]
-        mae_pivot_clean.index = [idx.replace('.csv', '') for idx in mae_pivot_clean.index]
-        
-        # 創建子圖
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
-
-        r2_vals = r2_pivot_clean.values.astype(float)
-
-        # 忽略 NaN 取 min/max
-        vmin = np.nanmin(r2_vals)
-        vmax = np.nanmax(r2_vals)
-
-        if not (vmin < 0 < vmax):
-            vmin = min(vmin, -1e-6)
-            vmax = max(vmax,  1e-6)
-
-        norm = TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
-
-        # ---- 自訂 colorbar 刻度 ----
-        neg_ticks = np.arange(np.floor(vmin/10)*10, 0, 10)
-        pos_step = 0.05 if vmax <= 1 else vmax/4
-        pos_ticks = np.arange(0, vmax + 1e-9, pos_step) if vmax > 0 else np.array([0.0])
-        ticks = np.unique(np.concatenate([neg_ticks, [0.0], pos_ticks]))
-
-        def format_colorbar_tick(value):
-            return f"{value:.2f}" if -1 < value < 1 else f"{int(value)}"
-
-        sns.heatmap(
-            r2_pivot_clean, annot=True, fmt='.2f',
-            cmap='RdYlGn', norm=norm, mask=np.isnan(r2_vals),
-            ax=ax1,
-            cbar_kws={'label': 'R²', 'ticks': ticks, 'format': matplotlib.ticker.FuncFormatter(lambda x, pos: format_colorbar_tick(x))},
-            annot_kws={'fontsize': 8}
-        )
-        ax1.set_title('R² Heatmap')
-        ax1.set_xlabel('Test')
-        ax1.set_ylabel('Train')
-        # 旋轉 x 軸標籤 45 度
-        ax1.set_xticklabels(ax1.get_xticklabels(), rotation=45, ha='right')
-        ax1.set_yticklabels(ax1.get_yticklabels(), rotation=0)
-        
-        # MAE 熱圖 - 修復顯示問題
-        sns.heatmap(mae_pivot_clean, annot=True, fmt='.1f', cmap='RdYlGn_r', 
-                    center=10.0, ax=ax2, cbar_kws={'label': 'MAE'},
-                    annot_kws={'fontsize': 8})
-        ax2.set_title('MAE Heatmap')
-        ax2.set_xlabel('Test')
-        ax2.set_ylabel('Train')
-        # 旋轉 x 軸標籤 45 度
-        ax2.set_xticklabels(ax2.get_xticklabels(), rotation=45, ha='right')
-        ax2.set_yticklabels(ax2.get_yticklabels(), rotation=0)
-        
-        plt.tight_layout()
-        plt.savefig('fixed_combo_heatmap.png', dpi=300, bbox_inches='tight')
-        print(f"Saved: fixed_combo_heatmap.png")
-    
-    # 處理第一個窗口 MAE 結果（如果啟用）
-    if args.enable_first_window_mae and len(first_window_mae_rows):
-        fw_mae_df = pd.DataFrame(first_window_mae_rows)
-        
-        # 生成第一個窗口 MAE 的 pivot table
-        fw_mae_pivot = fw_mae_df.pivot(index='train_csv', columns='test_csv', values='avg_first_window_mae')
-        
-        # 重置 index 名稱
-        fw_mae_pivot.index.name = 'train_file'
-        
-        # 儲存第一個窗口 MAE CSV 檔案
-        fw_mae_pivot.to_csv("first_window_mae_results.csv")
-        print(f"Saved: first_window_mae_results.csv")
-        
-        # 生成第一個窗口 MAE 熱圖
-        fw_mae_pivot_clean = fw_mae_pivot.copy()
-        
-        # 移除 columns 和 index 的 .csv 後綴
-        fw_mae_pivot_clean.columns = [col.replace('.csv', '') for col in fw_mae_pivot_clean.columns]
-        fw_mae_pivot_clean.index = [idx.replace('.csv', '') for idx in fw_mae_pivot_clean.index]
-        
-        # 創建第一個窗口 MAE 熱圖
-        plt.figure(figsize=(12, 8))
-        sns.heatmap(fw_mae_pivot_clean, annot=True, fmt='.2f', cmap='RdYlGn_r', 
-                    center=5.0, cbar_kws={'label': 'First Window MAE'},
-                    annot_kws={'fontsize': 8})
-        plt.title('First Window MAE Heatmap')
-        plt.xlabel('Test')
-        plt.ylabel('Train')
-        # 旋轉 x 軸標籤 45 度
-        plt.xticks(rotation=45, ha='right')
-        plt.yticks(rotation=0)
-        
-        plt.tight_layout()
-        plt.savefig('first_window_mae_heatmap.png', dpi=300, bbox_inches='tight')
-        print(f"Saved: first_window_mae_heatmap.png")
+    # 保存結果和生成可視化
+    _save_cv_results(combo_rows, first_window_mae_rows if args.enable_first_window_mae else None)
 
 
 if __name__ == "__main__":
