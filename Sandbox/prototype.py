@@ -2,8 +2,8 @@ import numpy as np
 import pandas as pd
 import re
 import os
-from sklearn.linear_model import LinearRegression, ElasticNet
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score, mean_absolute_error
 from scipy.stats import pearsonr
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端，避免 tkinter 错误
@@ -18,18 +18,9 @@ SAVE_PLOTS = False  # 是否保存每个 subject 的预测图
 # Normalization 参数
 USE_NORMALIZATION = True  # 是否使用归一化
 
-# L1 + L2 正则化参数
+# 正则化参数
 USE_REGULARIZATION = False  # 是否使用正则化
 ALPHA = 1.0  # 正则化强度 (alpha)
-L1_RATIO = 0.5  # L1 正则化比例 (0.0 = 纯 L2, 1.0 = 纯 L1, 0.5 = Elastic Net)
-
-# 选择要使用的通道 (可选: "cg", "cr", "yiq_i", "dbdr_dr", "pos_y", "chrom_x")
-# 例如: SELECTED_CHANNELS = ["cg", "cr"]  # 只使用 cg 和 cr
-#      SELECTED_CHANNELS = ["cg"]         # 只使用 cg
-#      SELECTED_CHANNELS = None           # 使用所有6个通道
-# 如果设置为 "all_single"，将测试所有单个通道并生成汇总报告
-# 如果设置为 "ensemble"，将使用 ensemble model pool 进行预测
-SELECTED_CHANNELS = "ensemble"  # None 表示使用所有通道, "all_single" 表示测试所有单个通道, "ensemble" 表示使用 ensemble 模型池
 
 # Ensemble 模型池配置
 TOP_K = 5  # 从其他模型中选择 TOP_K 个最相似的模型进行 ensemble
@@ -91,287 +82,160 @@ feat_df_all = pd.DataFrame(rows)
 print(f"Feature building completed. Total samples: {len(feat_df_all)}")
 print("=" * 60)
 
-def find_global_valid_features(feat_df, min_subject_ratio=0.0):
+def calculate_ccc(y_true, y_pred):
     """
-    方案一：全局特征筛选
-    找出在所有 subject 中都不是常数的特征（或至少在 min_subject_ratio 比例的 subject 中不是常数）
+    计算 Concordance Correlation Coefficient (CCC)
     
     Parameters:
     -----------
-    feat_df : DataFrame
-        特征数据，包含 'subject_id' 列和所有特征列
-    min_subject_ratio : float
-        最小 subject 比例阈值。0.0 表示必须在所有 subject 中都不是常数（交集）
-        0.8 表示至少在 80% 的 subject 中不是常数（并集）
+    y_true : ndarray
+        真实值
+    y_pred : ndarray
+        预测值
     
     Returns:
     --------
-    valid_features : list
-        有效的特征列名列表
-    feature_stats : dict
-        每个特征的统计信息，包括：
-        - 'constant_in_subjects': 在哪些 subject 中是常数
-        - 'valid_subject_count': 在多少个 subject 中不是常数
-        - 'valid_subject_ratio': 在多少比例的 subject 中不是常数
-    """
-    print("\n" + "=" * 60)
-    print("全局特征筛选分析...")
-    print("=" * 60)
-    
-    # 获取所有特征列（排除 subject_id 和 SPO2_win_mean）
-    all_feature_cols = [col for col in feat_df.columns 
-                       if col not in ['subject_id', 'SPO2_win_mean']]
-    
-    print(f"总特征数: {len(all_feature_cols)}")
-    print(f"特征列表: {all_feature_cols}")
-    
-    # 统计每个特征在每个 subject 中的情况
-    feature_stats = {}
-    for feat_col in all_feature_cols:
-        feature_stats[feat_col] = {
-            'constant_in_subjects': [],
-            'valid_subject_count': 0,
-            'valid_subject_ratio': 0.0
-        }
-    
-    total_subjects = 0
-    subject_constant_features = {}  # 记录每个 subject 的常数特征
-    
-    # 遍历每个 subject
-    for subject_id, subdf in feat_df.groupby("subject_id", sort=False):
-        total_subjects += 1
-        X_subject = subdf[all_feature_cols].astype(float)
-        
-        # 计算每个特征的标准差
-        stds = X_subject.std(axis=0)
-        constant_mask = stds < 1e-8
-        
-        # 记录这个 subject 的常数特征
-        constant_features = X_subject.columns[constant_mask].tolist()
-        subject_constant_features[subject_id] = constant_features
-        
-        # 更新每个特征的统计信息
-        for feat_col in all_feature_cols:
-            if feat_col in constant_features:
-                feature_stats[feat_col]['constant_in_subjects'].append(subject_id)
-            else:
-                feature_stats[feat_col]['valid_subject_count'] += 1
-    
-    # 计算每个特征的 valid_subject_ratio
-    for feat_col in all_feature_cols:
-        feature_stats[feat_col]['valid_subject_ratio'] = (
-            feature_stats[feat_col]['valid_subject_count'] / total_subjects
-        )
-    
-    # 根据 min_subject_ratio 筛选有效特征
-    valid_features = []
-    for feat_col in all_feature_cols:
-        ratio = feature_stats[feat_col]['valid_subject_ratio']
-        if ratio >= (1.0 - min_subject_ratio):
-            valid_features.append(feat_col)
-    
-    # 打印详细统计信息
-    print(f"\n总 subject 数: {total_subjects}")
-    print(f"筛选阈值: 至少在 {(1.0 - min_subject_ratio) * 100:.1f}% 的 subject 中不是常数")
-    print(f"\n有效特征数: {len(valid_features)} / {len(all_feature_cols)}")
-    
-    if len(valid_features) > 0:
-        print(f"\n有效特征列表:")
-        for feat in valid_features:
-            stats = feature_stats[feat]
-            print(f"  - {feat}: 在 {stats['valid_subject_count']}/{total_subjects} "
-                  f"({stats['valid_subject_ratio']*100:.1f}%) subject 中不是常数")
-    else:
-        print("\n警告: 没有找到符合条件的特征！")
-    
-    # 打印被移除的特征
-    removed_features = [f for f in all_feature_cols if f not in valid_features]
-    if len(removed_features) > 0:
-        print(f"\n被移除的特征 ({len(removed_features)} 个):")
-        for feat in removed_features:
-            stats = feature_stats[feat]
-            const_subjects = stats['constant_in_subjects']
-            print(f"  - {feat}: 在 {stats['valid_subject_count']}/{total_subjects} "
-                  f"({stats['valid_subject_ratio']*100:.1f}%) subject 中不是常数")
-            if len(const_subjects) > 0:
-                print(f"    常数 subject: {const_subjects[:5]}{'...' if len(const_subjects) > 5 else ''}")
-    
-    # 打印每个 subject 的常数特征统计
-    print(f"\n各 Subject 的常数特征统计:")
-    for subject_id, const_feats in sorted(subject_constant_features.items()):
-        print(f"  Subject {subject_id}: {len(const_feats)} 个常数特征")
-        if len(const_feats) > 0:
-            print(f"    {const_feats}")
-    
-    print("=" * 60)
-    
-    return valid_features, feature_stats
-
-# 全局特征筛选已移除 - 现在采用新策略：
-# 始终使用全部6个特征，如果段中有任何常数特征则跳过该段
-# 这样可以保证所有模型的特征维度完全一致 (300, 6)
-
-def train_and_evaluate(selected_channels, feat_df, save_plots=False):
-    """训练模型并评估，返回结果 DataFrame"""
-    # 打印使用的通道信息
-    if selected_channels is None:
-        used_channels = all_channel_names
-        print(f"使用所有通道: {used_channels}")
-    else:
-        used_channels = [ch for ch in selected_channels if ch in all_channel_names]
-        print(f"使用选定通道: {used_channels}")
-        if len(used_channels) != len(selected_channels):
-            print(f"警告: 部分通道名称无效，已忽略")
-    
-    # 从完整特征中选择指定通道的特征
-    feature_cols = [f"{ch}_mean" for ch in used_channels]
-    feat_df_selected = feat_df[["subject_id", "SPO2_win_mean"] + feature_cols].copy()
-
-    # Per-person Linear Regression training & backtest
-    results_lr_raw = []
-    for subject_id, subdf in feat_df_selected.groupby("subject_id", sort=False):
-        print(f"Training subject {subject_id}")
-        
-        # 取出原始 X / y
-        X_raw = subdf.drop(columns=["subject_id", "SPO2_win_mean"]).astype(float)
-        y = subdf["SPO2_win_mean"].values.astype(float)
-        if len(subdf) < 10:
-            continue
-
-        # ====== NEW: per-subject normalization ======
-        if USE_NORMALIZATION:
-            # 計算每個 feature 的 mean/std
-            means = X_raw.mean(axis=0)
-            stds = X_raw.std(axis=0)
-
-            # 避免 std = 0 的欄位（完全沒變化）
-            nonzero_mask = stds > 1e-8
-            if not np.all(nonzero_mask):
-                dropped_cols = X_raw.columns[~nonzero_mask].tolist()
-                if len(dropped_cols) > 0:
-                    print(f"  主體 {subject_id} 有常數特徵被移除: {dropped_cols}")
-                X_raw = X_raw.loc[:, nonzero_mask]
-                means = means[nonzero_mask]
-                stds = stds[nonzero_mask]
-
-            # 真正做 normalization
-            X = (X_raw - means) / stds
-        else:
-            # 不使用 normalization，但仍需要检查常数特征
-            stds = X_raw.std(axis=0)
-            nonzero_mask = stds > 1e-8
-            if not np.all(nonzero_mask):
-                dropped_cols = X_raw.columns[~nonzero_mask].tolist()
-                if len(dropped_cols) > 0:
-                    print(f"  主體 {subject_id} 有常數特徵被移除: {dropped_cols}")
-                X_raw = X_raw.loc[:, nonzero_mask]
-            X = X_raw
-        # ============================================
-
-        # 根據配置選擇使用正則化或普通線性回歸
-        if USE_REGULARIZATION:
-            # 你目前是用 ElasticNet，如果之後想改成 Ridge：
-            from sklearn.linear_model import Ridge
-            lr = Ridge(alpha=ALPHA)
-            # lr = ElasticNet(alpha=ALPHA, l1_ratio=L1_RATIO, max_iter=10000, random_state=42)
-        else:
-            lr = LinearRegression()
-
-        lr.fit(X, y)
-        yhat = lr.predict(X)
-
-        # 計算評估指標
-        r2 = r2_score(y, yhat)
-        mae = mean_absolute_error(y, yhat)
-        rmse = np.sqrt(mean_squared_error(y, yhat))
-
-        # ====== NEW: 避免 constant 警告 ======
-        if np.std(yhat) < 1e-8:
-            # 預測是常數，pearsonr 會丟 ConstantInputWarning
-            pcc = np.nan   # 或者你想設成 0 也可以
-            print(f"  主體 {subject_id} 預測為常數，PCC 設為 NaN")
-        else:
-            pcc, _ = pearsonr(y, yhat)
-        # ====================================
-
-        results_lr_raw.append({
-            "subject_id": subject_id,
-            "n_frames": len(subdf),
-            "R2": r2,
-            "MAE": mae,
-            "RMSE": rmse,
-            "PCC": pcc
-        })
-        
-        # 為每个 subject 生成并保存预测曲线图（如果启用）
-        if save_plots:
-            plt.figure(figsize=(10, 5))
-            plt.plot(y, label="True SpO2", linewidth=1.5, color='black')
-            plt.plot(yhat, label="Predicted SpO2 (LR)", linewidth=1.5, color='blue', linestyle='--')
-            plt.title(f"Subject {subject_id} - Backtest (Linear Regression, R²={r2:.3f}, MAE={mae:.2f}, RMSE={rmse:.2f}, PCC={pcc if not np.isnan(pcc) else 0:.3f})")
-            plt.xlabel("Frame index")
-            plt.ylabel("SpO2")
-            plt.legend()
-            plt.grid(True, alpha=0.3)
-            
-            # 保存图表
-            if selected_channels is None:
-                ch_suffix = "all"
-            else:
-                ch_suffix = "_".join(selected_channels)
-            output_path = os.path.join(OUTPUT_DIR, f"vis_{subject_id}_{ch_suffix}.png")
-            plt.savefig(output_path, dpi=120, bbox_inches='tight')
-            plt.close()
-
-    results_lr_raw_df = pd.DataFrame(results_lr_raw).sort_values("R2", ascending=False)
-    return results_lr_raw_df
-
-def calculate_similarity(features_A, features_B):
-    """
-    计算两组特征之间的相似度（使用 Pearson Correlation）
-    
-    假设两组特征的维度完全相同（segment_length x n_features），
-    将特征矩阵 flatten 后计算 Pearson correlation。
-    
-    Parameters:
-    -----------
-    features_A : DataFrame or ndarray
-        第一组特征 (segment_length, n_features)
-    features_B : DataFrame or ndarray
-        第二组特征 (segment_length, n_features)
-    
-    Returns:
-    --------
-    similarity_score : float
-        相似度分数（-1 到 1 之间，越大越相似）
+    ccc : float
+        CCC 值（-1 到 1 之间，越接近 1 越好）
         如果计算失败，返回 -1
     """
+    # 检查是否有常数向量
+    if np.std(y_true) < 1e-8 or np.std(y_pred) < 1e-8:
+        return -1.0
+    
+    # 计算均值
+    mean_true = np.mean(y_true)
+    mean_pred = np.mean(y_pred)
+    
+    # 计算方差
+    var_true = np.var(y_true)
+    var_pred = np.var(y_pred)
+    
+    # 计算协方差
+    covariance = np.mean((y_true - mean_true) * (y_pred - mean_pred))
+    
+    # 计算 CCC
+    numerator = 2 * covariance
+    denominator = var_true + var_pred + (mean_true - mean_pred) ** 2
+    
+    if denominator < 1e-8:
+        return -1.0
+    
+    ccc = numerator / denominator
+    return ccc if not np.isnan(ccc) else -1.0
+
+
+def calculate_similarity(features_model, features_test, weights_model):
+    """
+    计算模型与测试样本之间的 Shape Similarity 和 Range Similarity
+    
+    【Shape Similarity】（主要条件）
+    - 指标：Pearson correlation
+    - 资料：z-score 后的 feature
+    - normalization 规则：
+      - model 的 feature → 用 model 自己的 mean/std
+      - test subject 的 feature → 用 test subject 自己的 mean/std
+    - 对 6 个通道各自算 Pearson
+    - 用 |w_s| 对 6 个通道的 Pearson 加权平均
+    
+    【Range Similarity】（辅助条件）
+    - 指标：CCC（Concordance Correlation Coefficient）
+    - 资料：raw feature（不做 z-score）
+    - 对 6 个通道各自算 CCC
+    - 同样用 |w_s| 加权平均
+    
+    Parameters:
+    -----------
+    features_model : ndarray
+        模型的原始特征 (segment_length, n_features=6)
+    features_test : ndarray
+        测试样本的原始特征 (segment_length, n_features=6)
+    weights_model : ndarray
+        模型的权重 (n_features=6,)，用于加权
+    
+    Returns:
+    --------
+    shape_score : float
+        Shape similarity 分数（-1 到 1 之间，越大越相似）
+    range_score : float
+        Range similarity 分数（-1 到 1 之间，越大越相似）
+    """
     # 转换为 numpy array
-    if isinstance(features_A, pd.DataFrame):
-        features_A = features_A.values
-    if isinstance(features_B, pd.DataFrame):
-        features_B = features_B.values
+    if isinstance(features_model, pd.DataFrame):
+        features_model = features_model.values
+    if isinstance(features_test, pd.DataFrame):
+        features_test = features_test.values
     
     # 检查维度是否相同
-    if features_A.shape != features_B.shape:
-        print(f"  警告: 特征维度不匹配 {features_A.shape} vs {features_B.shape}")
-        return -1.0
+    if features_model.shape != features_test.shape:
+        print(f"  警告: 特征维度不匹配 {features_model.shape} vs {features_test.shape}")
+        return -1.0, -1.0
     
-    # Flatten 特征矩阵
-    vec_A = features_A.flatten()
-    vec_B = features_B.flatten()
+    n_samples, n_features = features_model.shape
     
-    # 检查是否有常数向量
-    if np.std(vec_A) < 1e-8 or np.std(vec_B) < 1e-8:
-        return -1.0
+    # 检查特征数量是否为 6
+    if n_features != 6:
+        print(f"  警告: 期望 6 个特征，实际得到 {n_features} 个")
+        return -1.0, -1.0
     
-    # 计算 Pearson correlation
-    try:
-        corr, _ = pearsonr(vec_A, vec_B)
-        return corr if not np.isnan(corr) else -1.0
-    except Exception as e:
-        print(f"  计算 correlation 时出错: {e}")
-        return -1.0
+    # 计算权重的绝对值（用于加权平均）
+    abs_weights = np.abs(weights_model)
+    weight_sum = np.sum(abs_weights)
+    
+    if weight_sum < 1e-8:
+        print(f"  警告: 权重总和接近 0")
+        return -1.0, -1.0
+    
+    # 归一化权重
+    normalized_weights = abs_weights / weight_sum
+    
+    # === 1. 计算 Shape Similarity ===
+    shape_scores = []
+    for i in range(n_features):
+        # 对模型特征做 z-score（用模型自己的 mean/std）
+        model_channel = features_model[:, i]
+        model_mean = np.mean(model_channel)
+        model_std = np.std(model_channel)
+        
+        # 对测试特征做 z-score（用测试自己的 mean/std）
+        test_channel = features_test[:, i]
+        test_mean = np.mean(test_channel)
+        test_std = np.std(test_channel)
+        
+        # 检查是否有常数通道
+        if model_std < 1e-8 or test_std < 1e-8:
+            shape_scores.append(-1.0)
+            continue
+        
+        # Z-score normalization
+        model_channel_zscore = (model_channel - model_mean) / model_std
+        test_channel_zscore = (test_channel - test_mean) / test_std
+        
+        # 计算 Pearson correlation
+        try:
+            corr, _ = pearsonr(model_channel_zscore, test_channel_zscore)
+            shape_scores.append(corr if not np.isnan(corr) else -1.0)
+        except Exception as e:
+            shape_scores.append(-1.0)
+    
+    # 加权平均
+    shape_score = np.sum(np.array(shape_scores) * normalized_weights)
+    
+    # === 2. 计算 Range Similarity ===
+    range_scores = []
+    for i in range(n_features):
+        # 直接使用原始特征（不做 z-score）
+        model_channel = features_model[:, i]
+        test_channel = features_test[:, i]
+        
+        # 计算 CCC
+        ccc = calculate_ccc(model_channel, test_channel)
+        range_scores.append(ccc)
+    
+    # 加权平均
+    range_score = np.sum(np.array(range_scores) * normalized_weights)
+    
+    return shape_score, range_score
 
 def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH):
     """
@@ -423,6 +287,8 @@ def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH):
     model_pool = []
     total_segments = 0
     skipped_subjects = 0
+    filtered_by_pcc = 0  # 因 PCC <= 0.3 被过滤的模型数
+    filtered_by_r2 = 0  # 因 R² <= 0.1 被过滤的模型数
     
     # 为每个 subject 切分并训练多个模型
     for subject_id, subdf in feat_df_selected.groupby("subject_id", sort=False):
@@ -484,6 +350,34 @@ def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH):
             
             lr.fit(X_normalized, y_segment)
             
+            # 训练后立即评估：计算预测值与真实值的 PCC 和 R²
+            y_pred = lr.predict(X_normalized)
+            
+            # 计算 R²
+            train_r2 = r2_score(y_segment, y_pred)
+            if np.isnan(train_r2):
+                train_r2 = -1.0
+            
+            # 计算 PCC（Pearson correlation coefficient）
+            if np.std(y_pred) < 1e-8 or np.std(y_segment) < 1e-8:
+                # 如果预测值或真实值为常数，PCC 设为 -1（会被过滤）
+                train_pcc = -1.0
+            else:
+                train_pcc, _ = pearsonr(y_segment, y_pred)
+                if np.isnan(train_pcc):
+                    train_pcc = -1.0
+            
+            # 筛选条件：同时检查 R² > 0.3 和 PCC > 0.5
+            if train_r2 <= 0.3:
+                print(f"  段 {seg_idx}: 跳过（训练集 R² = {train_r2:.4f} <= 0.3）")
+                filtered_by_r2 += 1
+                continue
+            
+            if train_pcc <= 0.5:
+                print(f"  段 {seg_idx}: 跳过（训练集 PCC = {train_pcc:.4f} <= 0.5）")
+                filtered_by_pcc += 1
+                continue
+            
             # 保存到模型池
             # 注意：所有模型都使用全部特征，维度固定为 (segment_length, n_features)
             model_id = f"{subject_id}_seg{seg_idx}"
@@ -493,6 +387,8 @@ def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH):
                 'model_id': model_id,
                 'model': lr,
                 'feature_cols': X_raw_segment.columns.tolist(),  # 全部特征列
+                'weights': lr.coef_,  # 模型权重 (n_features,)
+                'bias': lr.intercept_,  # 模型偏置
                 'means': means.values if means is not None else None,
                 'stds': stds.values if stds is not None else None,
                 'X_raw_segment': X_raw_segment.values  # 保存原始特征矩阵 (segment_length, n_features) 用于相似度计算
@@ -505,7 +401,10 @@ def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH):
     print(f"  总 subject 数: {len(feat_df_selected['subject_id'].unique())}")
     print(f"  跳过 subject 数: {skipped_subjects}")
     print(f"  有效 subject 数: {len(feat_df_selected['subject_id'].unique()) - skipped_subjects}")
-    print(f"  总模型数: {len(model_pool)}")
+    print(f"  训练的总段数: {total_segments + filtered_by_pcc + filtered_by_r2}")
+    print(f"  因 R² <= 0.3 被过滤: {filtered_by_r2} 个模型")
+    print(f"  因 PCC <= 0.5 被过滤: {filtered_by_pcc} 个模型")
+    print(f"  最终模型池大小: {len(model_pool)} 个模型")
     print(f"  平均每个 subject: {len(model_pool) / max(1, len(feat_df_selected['subject_id'].unique()) - skipped_subjects):.1f} 个模型")
     print("=" * 60)
     return model_pool
@@ -548,6 +447,10 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
     feat_df_selected = feat_df[["subject_id", "SPO2_win_mean"] + feature_cols].copy()
     
     results = []
+    
+    # 用于存储所有 subject 的预测结果和真实值（用于计算整体 PCC）
+    all_subjects_predictions = []
+    all_subjects_labels = []
     
     # 对每个 subject 进行测试
     for test_subject_id, test_subdf in feat_df_selected.groupby("subject_id", sort=False):
@@ -604,13 +507,15 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                 
                 # 获取该模型训练时使用的特征矩阵（维度固定为 segment_length x n_features）
                 X_train_segment = model_info['X_raw_segment']
+                weights = model_info['weights']
                 
-                # 计算相似度（使用 correlation，使用 numpy array）
+                # 计算相似度（返回 shape_score 和 range_score）
                 # 现在两个矩阵维度应该完全一致 (segment_length, n_features)
-                similarity = calculate_similarity(X_train_segment, X_test_segment_array)
+                shape_score, range_score = calculate_similarity(X_train_segment, X_test_segment_array, weights)
                 similarities.append({
                     'model_info': model_info,
-                    'similarity': similarity,
+                    'shape_score': shape_score,
+                    'range_score': range_score,
                     'model_id': model_id
                 })
             
@@ -618,37 +523,44 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                 print(f"  测试段 {test_seg_idx}: 没有可用的模型")
                 continue
             
-            # 按相似度排序，选择 TOP_K
-            similarities.sort(key=lambda x: x['similarity'], reverse=True)
-            top_k_models = similarities[:min(top_k, len(similarities))]
+            # 【两层筛选】
+            # 第 1 层：按 shape_score 排序，取前 M = 2*top_k
+            M = 2 * top_k
+            similarities.sort(key=lambda x: x['shape_score'], reverse=True)
+            top_m_candidates = similarities[:min(M, len(similarities))]
+            
+            # 第 2 层：在这 M 个候选中，按 range_score 排序，取前 TOP_K
+            top_m_candidates.sort(key=lambda x: x['range_score'], reverse=True)
+            top_k_models = top_m_candidates[:min(top_k, len(top_m_candidates))]
             
             # 打印选择的模型
             if test_seg_idx == 0:  # 只在第一段打印详细信息
-                print(f"  测试段 {test_seg_idx} 选择的 TOP_{min(top_k, len(similarities))} 模型:")
+                print(f"  测试段 {test_seg_idx} 选择的 TOP_{min(top_k, len(top_k_models))} 模型:")
                 for rank, sim_info in enumerate(top_k_models, 1):
-                    print(f"    {rank}. {sim_info['model_id']}, 相似度: {sim_info['similarity']:.4f}")
+                    print(f"    {rank}. {sim_info['model_id']}, shape: {sim_info['shape_score']:.4f}, range: {sim_info['range_score']:.4f}")
+            
+            # 【关键修改】所有模型在「test subject 的座标系」下预测
+            # Step 1: 计算 test subject 自己的 mean 和 std
+            test_means = X_test_segment_df.mean(axis=0)
+            test_stds = X_test_segment_df.std(axis=0)
+            
+            # Step 2: 用 test subject 的 mean/std 做 normalization
+            X_test_normalized = (X_test_segment_df - test_means) / test_stds
             
             # 使用 TOP_K 模型进行预测
             segment_predictions = []
             for sim_info in top_k_models:
                 model_info = sim_info['model_info']
-                model = model_info['model']
-                means = model_info['means']
-                stds = model_info['stds']
+                weights = model_info['weights']
+                bias = model_info['bias']
                 feature_cols_model = model_info['feature_cols']
                 
-                # 应用相同的预处理（使用 DataFrame 以匹配训练时的特征名称）
-                # 确保特征顺序与训练时一致
-                X_test_segment_aligned = X_test_segment_df[feature_cols_model].copy()
+                # 确保特征顺序与模型训练时一致
+                X_test_normalized_aligned = X_test_normalized[feature_cols_model].values
                 
-                # 根据训练时是否使用 normalization 来决定预处理方式
-                if USE_NORMALIZATION and means is not None and stds is not None:
-                    X_test_normalized = (X_test_segment_aligned - means) / stds
-                else:
-                    X_test_normalized = X_test_segment_aligned
-                
-                # 预测（使用 DataFrame，避免特征名称警告）
-                y_pred = model.predict(X_test_normalized)
+                # Step 3: 手动计算预测值 y_hat = w^T x_norm + b
+                # 所有模型都用 test subject normalized 的 features
+                y_pred = np.dot(X_test_normalized_aligned, weights) + bias
                 segment_predictions.append(y_pred)
             
             # Ensemble: 取平均
@@ -691,6 +603,10 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
         
         print(f"  R² = {r2:.4f}, MAE = {mae:.4f}, PCC = {pcc if not np.isnan(pcc) else 0:.4f}")
         
+        # 将当前 subject 的预测结果和真实值添加到整体列表中
+        all_subjects_predictions.append(y_ensemble)
+        all_subjects_labels.append(y_test)
+        
         # 保存预测图表（如果启用）
         if save_plots:
             plt.figure(figsize=(10, 5))
@@ -707,136 +623,65 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
             plt.close()
     
     results_df = pd.DataFrame(results)
+    
+    # 计算所有 subject 串联后的整体 PCC
+    if len(all_subjects_predictions) > 0:
+        all_predictions_concatenated = np.concatenate(all_subjects_predictions)
+        all_labels_concatenated = np.concatenate(all_subjects_labels)
+        
+        if np.std(all_predictions_concatenated) < 1e-8:
+            overall_pcc = np.nan
+            print(f"\n整体预测为常数，整体 PCC 设为 NaN")
+        else:
+            overall_pcc, _ = pearsonr(all_labels_concatenated, all_predictions_concatenated)
+            print(f"\n所有 subject 串联后的整体 PCC: {overall_pcc:.6f}")
+            print(f"总样本数: {len(all_predictions_concatenated)}")
+    else:
+        overall_pcc = np.nan
+        print("\n没有有效的预测结果，无法计算整体 PCC")
+    
     print("\n" + "=" * 60)
     print("Ensemble 预测完成")
     print("=" * 60)
+    
+    # 将整体 PCC 添加到结果中
+    results_df['overall_PCC'] = overall_pcc
+    
     return results_df
 
-# 主程序逻辑
-if SELECTED_CHANNELS == "ensemble":
-    # 使用 ensemble model pool 进行预测
-    print("\n" + "=" * 60)
-    print("Ensemble Model Pool 模式")
-    print("=" * 60)
-    
-    # 训练模型池（使用所有通道）
-    model_pool = train_model_pool(None, feat_df_all, segment_length=SEGMENT_LENGTH)
-    
-    # 使用 ensemble 进行预测和评估
-    results_ensemble_df = ensemble_predict_and_evaluate(
-        model_pool, 
-        feat_df_all, 
-        selected_channels=None, 
-        top_k=TOP_K, 
-        segment_length=SEGMENT_LENGTH,
-        save_plots=SAVE_PLOTS
-    )
-    
-    # 保存结果
-    results_path = os.path.join(OUTPUT_DIR, f"results_ensemble_topk{TOP_K}_seg{SEGMENT_LENGTH}.csv")
-    results_ensemble_df.to_csv(results_path, index=False)
-    
-    # 输出统计信息
-    print("\n" + "=" * 60)
-    print("Ensemble 评估结果汇总:")
-    print("=" * 60)
-    print(f"总测试 subjects 数: {len(results_ensemble_df)}")
-    print(f"平均 R²: {results_ensemble_df['R2'].mean():.4f}")
-    print(f"平均 MAE: {results_ensemble_df['MAE'].mean():.4f}")
-    print(f"平均 PCC: {results_ensemble_df['PCC'].mean():.4f}")
-    print(f"\n结果已保存到: {results_path}")
-    print("=" * 60)
-    print("\n详细结果:")
-    print(results_ensemble_df.to_string(index=False))
+# 主程序逻辑 - Ensemble Model Pool 模式
+print("\n" + "=" * 60)
+print("Ensemble Model Pool 模式")
+print("=" * 60)
 
-elif SELECTED_CHANNELS == "all_single":
-    # 测试所有单个通道并生成汇总报告
-    print("\n" + "=" * 60)
-    print("测试所有单个通道...")
-    print("=" * 60)
-    
-    summary_results = []
-    
-    # 测试每个单个通道
-    for ch in all_channel_names:
-        print(f"\n{'='*60}")
-        print(f"测试通道: {ch}")
-        print(f"{'='*60}")
-        results_df = train_and_evaluate([ch], feat_df_all, save_plots=SAVE_PLOTS)
-        
-        # 计算平均值
-        avg_r2 = results_df["R2"].mean()
-        avg_mae = results_df["MAE"].mean()
-        avg_pcc = results_df["PCC"].mean()
-        
-        # 计算 PCC 低于阈值的 subject 比例
-        total_subjects = len(results_df)
-        pcc_lt_0_5_ratio = (results_df["PCC"] < 0.5).sum() / total_subjects
-        pcc_lt_0_4_ratio = (results_df["PCC"] < 0.4).sum() / total_subjects
-        pcc_lt_0_3_ratio = (results_df["PCC"] < 0.3).sum() / total_subjects
-        
-        summary_results.append({
-            "channel": ch,
-            "avg_R2": avg_r2,
-            "avg_MAE": avg_mae,
-            "avg_PCC": avg_pcc,
-            "pcc_lt_0.5_ratio": pcc_lt_0_5_ratio,
-            "pcc_lt_0.4_ratio": pcc_lt_0_4_ratio,
-            "pcc_lt_0.3_ratio": pcc_lt_0_3_ratio
-        })
-        
-        print(f"通道 {ch} - 平均 R²: {avg_r2:.4f}, 平均 MAE: {avg_mae:.4f}, 平均 PCC: {avg_pcc:.4f}")
-        print(f"  PCC < 0.5 比例: {pcc_lt_0_5_ratio:.3f}, PCC < 0.4 比例: {pcc_lt_0_4_ratio:.3f}, PCC < 0.3 比例: {pcc_lt_0_3_ratio:.3f}")
-    
-    # 测试所有通道组合
-    print(f"\n{'='*60}")
-    print(f"测试所有通道组合")
-    print(f"{'='*60}")
-    results_df_all = train_and_evaluate(None, feat_df_all, save_plots=SAVE_PLOTS)
-    avg_r2_all = results_df_all["R2"].mean()
-    avg_mae_all = results_df_all["MAE"].mean()
-    avg_pcc_all = results_df_all["PCC"].mean()
-    
-    # 计算 PCC 低于阈值的 subject 比例
-    total_subjects_all = len(results_df_all)
-    pcc_lt_0_5_ratio_all = (results_df_all["PCC"] < 0.5).sum() / total_subjects_all
-    pcc_lt_0_4_ratio_all = (results_df_all["PCC"] < 0.4).sum() / total_subjects_all
-    pcc_lt_0_3_ratio_all = (results_df_all["PCC"] < 0.3).sum() / total_subjects_all
-    
-    summary_results.append({
-        "channel": "all",
-        "avg_R2": avg_r2_all,
-        "avg_MAE": avg_mae_all,
-        "avg_PCC": avg_pcc_all,
-        "pcc_lt_0.5_ratio": pcc_lt_0_5_ratio_all,
-        "pcc_lt_0.4_ratio": pcc_lt_0_4_ratio_all,
-        "pcc_lt_0.3_ratio": pcc_lt_0_3_ratio_all
-    })
-    print(f"所有通道 - 平均 R²: {avg_r2_all:.4f}, 平均 MAE: {avg_mae_all:.4f}, 平均 PCC: {avg_pcc_all:.4f}")
-    print(f"  PCC < 0.5 比例: {pcc_lt_0_5_ratio_all:.3f}, PCC < 0.4 比例: {pcc_lt_0_4_ratio_all:.3f}, PCC < 0.3 比例: {pcc_lt_0_3_ratio_all:.3f}")
-    
-    # 保存汇总结果
-    summary_df = pd.DataFrame(summary_results)
-    summary_path = os.path.join(OUTPUT_DIR, "channel_comparison_summary.csv")
-    summary_df.to_csv(summary_path, index=False)
-    print(f"\n{'='*60}")
-    print(f"汇总结果已保存到: {summary_path}")
-    print(f"{'='*60}")
-    print(summary_df.to_string(index=False))
-    
-else:
-    # 使用指定的通道配置
-    results_lr_raw_df = train_and_evaluate(SELECTED_CHANNELS, feat_df_all, save_plots=SAVE_PLOTS)
-    
-    # 保存结果表格
-    # 生成通道标识符用于文件名
-    if SELECTED_CHANNELS is None:
-        ch_suffix = "all"
-    else:
-        ch_suffix = "_".join(SELECTED_CHANNELS)
-    results_path = os.path.join(OUTPUT_DIR, f"results_summary_lr_{ch_suffix}.csv")
-    results_lr_raw_df.to_csv(results_path, index=False)
-    print(f"Results saved to {results_path}")
-    print(f"Total subjects: {len(results_lr_raw_df)}")
-    if SAVE_PLOTS:
-        print(f"All prediction curves saved to {OUTPUT_DIR}/")
+# 训练模型池（使用所有通道）
+model_pool = train_model_pool(None, feat_df_all, segment_length=SEGMENT_LENGTH)
+
+# 使用 ensemble 进行预测和评估
+results_ensemble_df = ensemble_predict_and_evaluate(
+    model_pool, 
+    feat_df_all, 
+    selected_channels=None, 
+    top_k=TOP_K, 
+    segment_length=SEGMENT_LENGTH,
+    save_plots=SAVE_PLOTS
+)
+
+# 保存结果
+results_path = os.path.join(OUTPUT_DIR, f"results_ensemble_topk{TOP_K}_seg{SEGMENT_LENGTH}.csv")
+results_ensemble_df.to_csv(results_path, index=False)
+
+# 输出统计信息
+print("\n" + "=" * 60)
+print("Ensemble 评估结果汇总:")
+print("=" * 60)
+print(f"总测试 subjects 数: {len(results_ensemble_df)}")
+print(f"平均 R²: {results_ensemble_df['R2'].mean():.4f}")
+print(f"平均 MAE: {results_ensemble_df['MAE'].mean():.4f}")
+print(f"平均 PCC (每个 subject): {results_ensemble_df['PCC'].mean():.4f}")
+if 'overall_PCC' in results_ensemble_df.columns and not pd.isna(results_ensemble_df['overall_PCC'].iloc[0]):
+    print(f"整体 PCC (所有 subject 串联): {results_ensemble_df['overall_PCC'].iloc[0]:.6f}")
+print(f"\n结果已保存到: {results_path}")
+print("=" * 60)
+print("\n详细结果:")
+print(results_ensemble_df.to_string(index=False))
