@@ -494,10 +494,13 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                                   save_plots=False, output_dir=OUTPUT_DIR):
     """
     使用 ensemble 模型池進行預測與評估。
-    新增邏輯：不足 900 幀的結尾殘餘段落，直接沿用最後一次選出的 TOP_K 模型。
+    邏輯更新：
+    1. Folder 總長度不足 segment_length (900) 的直接捨棄。
+    2. 第一段 900 幀正常挑選模型。
+    3. 結尾不足 900 的殘餘部分，直接沿用該 Folder 最後一次選出的模型。
     """
     print("\n" + "=" * 60)
-    print(f"使用 Ensemble 模型池進行預測 (TOP_K={top_k}, 段長度={segment_length}, 依 Folder 獨立)...")
+    print(f"使用 Ensemble 模型池進行預測 (TOP_K={top_k}, 段長度={segment_length})...")
     print("=" * 60)
     
     if selected_channels is None:
@@ -514,30 +517,30 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
     all_subjects_labels = []
 
     for test_subject_id, test_subdf in feat_df_selected.groupby("subject_id", sort=False):
-        n_samples_sub = len(test_subdf)
-        print(f"\n測試 Subject {test_subject_id}: 總共 {n_samples_sub} 個樣本")
+        print(f"\n測試 Subject {test_subject_id}")
         
         subject_segment_predictions = []
         subject_segment_labels = []
 
         for folder_name, folder_df in test_subdf.groupby("folder_name", sort=False):
             n_samples = len(folder_df)
-            # 如果連一個滑窗的長度都不夠，就真的沒救了
-            if n_samples < WIN_LEN:
+            
+            # 【修改點】：如果 Folder 總長度不到 900，直接捨棄，不進行特例處理
+            if n_samples < segment_length:
+                print(f"  Folder {folder_name}: 長度不足 {segment_length}，已捨棄。")
                 continue
                 
             n_test_segments = n_samples // segment_length
-            total_segments = math.ceil(n_samples / segment_length) # 包含殘餘段落的總段數
+            total_segments = math.ceil(n_samples / segment_length) 
             
             X_test_full = folder_df[feature_cols].astype(float)
             rgb_mean_test_full = folder_df[rgb_mean_col_names].astype(float)
             y_test_full = folder_df["SPO2_win_mean"].values.astype(float)
             
-            last_top_k_models = None # 用來記住上一段的 TOP_K 模型
+            last_top_k_models = None 
 
             for test_seg_idx in range(total_segments):
                 start_idx = test_seg_idx * segment_length
-                # 確保 end_idx 不會超過總樣本數
                 end_idx = min(start_idx + segment_length, n_samples) 
                 
                 X_test_segment_df = X_test_full.iloc[start_idx:end_idx].copy()
@@ -545,14 +548,10 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                 
                 test_stds = X_test_segment_df.std(axis=0)
                 if (test_stds < 1e-8).any():
-                    constant_cols = X_test_segment_df.columns[test_stds < 1e-8].tolist()
-                    print(f"  測試段 {folder_name}_seg{test_seg_idx}: 跳過（有常數特徵: {constant_cols}）")
                     continue
                 
-                # 判斷是否需要「重新計算相似度並挑選模型」
-                # 條件 1：這是一段完整的 900 幀 (test_seg_idx < n_test_segments)
-                # 條件 2：這是第一段，但因為 Folder 總長度不足 900，所以沒有上一段可以沿用 (last_top_k_models is None)
-                if test_seg_idx < n_test_segments or last_top_k_models is None:
+                # 只有在完整的 900 幀段落才重新挑選模型
+                if test_seg_idx < n_test_segments:
                     X_test_segment_array = X_test_segment_df.values
                     rgb_mean_test_segment = rgb_mean_test_full.iloc[start_idx:end_idx].mean(axis=0).values
                     
@@ -561,10 +560,7 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                         if model_info['subject_id'] == test_subject_id:
                             continue
                             
-                        X_train_segment = model_info['X_raw_segment']
-                        weights = model_info['weights']
-                        
-                        shape_score, range_score = calculate_similarity(X_train_segment, X_test_segment_array, weights)
+                        shape_score, range_score = calculate_similarity(model_info['X_raw_segment'], X_test_segment_array, model_info['weights'])
                         rgb_score = calculate_rgb_similarity(model_info['rgb_mean_segment'], rgb_mean_test_segment)
                         
                         similarities.append({
@@ -576,50 +572,41 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                         })
                         
                     if len(similarities) == 0:
-                        print(f"  測試段 {folder_name}_seg{test_seg_idx}: 沒有可用模型")
                         continue
 
-                    M = 2 * top_k
+                    # 排序篩選 TOP_K
                     similarities.sort(key=lambda x: x['shape_score'], reverse=True)
-                    top_m_candidates = similarities[:min(M, len(similarities))]
+                    top_m_candidates = similarities[:min(2 * top_k, len(similarities))]
                     top_m_candidates.sort(key=lambda x: x['range_score'] + RGB_SIM_WEIGHT * x['rgb_score'], reverse=True)
                     top_k_models = top_m_candidates[:min(top_k, len(top_m_candidates))]
                     
-                    # 把這組挑出來的模型存起來，如果下一段是殘餘段落就可以直接用
                     last_top_k_models = top_k_models 
                     
                 else:
-                    # 這裡是不足 900 的殘餘段落，直接沿用
+                    # 殘餘段落：沿用最後一次成功的模型組合
                     top_k_models = last_top_k_models
-                    print(f"  測試段 {folder_name}_seg{test_seg_idx} (殘餘 {end_idx - start_idx} 幀): 沿用上一段的 TOP_{top_k} 模型")
+                    if top_k_models is None: # 防護邏輯：理論上上面已經過濾長度，此處不應發生
+                        continue
 
-                # 正規化
+                # 預測運算
                 if use_normalization:
-                    test_means = X_test_segment_df.mean(axis=0)
-                    test_stds = X_test_segment_df.std(axis=0)
-                    X_test_normalized = (X_test_segment_df - test_means) / test_stds
+                    test_means, test_stds = X_test_segment_df.mean(axis=0), X_test_segment_df.std(axis=0)
+                    X_test_input = (X_test_segment_df - test_means) / test_stds
                 else:
-                    X_test_normalized = X_test_segment_df
+                    X_test_input = X_test_segment_df
 
-                # 預測
-                segment_predictions = []
+                segment_preds = []
                 for sim_info in top_k_models:
-                    model_info = sim_info['model_info']
-                    weights = model_info['weights']
-                    bias = model_info['bias']
-                    feature_cols_model = model_info['feature_cols']
+                    m = sim_info['model_info']
+                    y_p = np.dot(X_test_input[m['feature_cols']].values, m['weights']) + m['bias']
+                    segment_preds.append(y_p)
                     
-                    X_test_normalized_aligned = X_test_normalized[feature_cols_model].values
-                    y_pred = np.dot(X_test_normalized_aligned, weights) + bias
-                    segment_predictions.append(y_pred)
-                    
-                if len(segment_predictions) > 0:
-                    y_segment_ensemble = np.mean(segment_predictions, axis=0)
-                    subject_segment_predictions.append(y_segment_ensemble)
+                if len(segment_preds) > 0:
+                    subject_segment_predictions.append(np.mean(segment_preds, axis=0))
                     subject_segment_labels.append(y_test_segment)
 
+        # 彙整該 Subject 結果
         if len(subject_segment_predictions) == 0:
-            print(f"  跳過 Subject {test_subject_id}: 沒有成功預測的段")
             continue
 
         y_ensemble = np.concatenate(subject_segment_predictions)
@@ -629,16 +616,7 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
         mae = mean_absolute_error(y_test, y_ensemble)
         pcc = np.nan if np.std(y_ensemble) < 1e-8 else pearsonr(y_test, y_ensemble)[0]
         
-        results.append({
-            "subject_id": test_subject_id,
-            "n_frames": len(y_test),
-            "n_segments": len(subject_segment_predictions),
-            "n_models_used": top_k,
-            "R2": r2,
-            "MAE": mae,
-            "PCC": pcc
-        })
-        print(f"  完成推論：累積 {len(y_test)} 幀, R² = {r2:.4f}, MAE = {mae:.4f}, PCC = {pcc if not np.isnan(pcc) else 0:.4f}")
+        results.append({"subject_id": test_subject_id, "n_frames": len(y_test), "R2": r2, "MAE": mae, "PCC": pcc})
         all_subjects_predictions.append(y_ensemble)
         all_subjects_labels.append(y_test)
 
