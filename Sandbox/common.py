@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import re
 import os
+import math
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score, mean_absolute_error
 from scipy.stats import pearsonr
@@ -176,30 +177,26 @@ def butter_filter(sig, fs=30, cutoff=0.1, btype='low', order=3):
 
 
 def build_features_from_df(df, source_name=None):
-    """
-    從單一 CSV 的 DataFrame 建特徵。
-    流程：POS → rPPG → HR（每 HR_UPDATE_SEC 秒更新）→ 帶通濾波 RGB → 滑窗 AC/DC。
-    前 MIN_RPPG_FRAMES 筆因無法穩定估計 HR 而丟棄。
-    回傳 list of dict（每筆一 row）。
-    """
     df = df.copy()
     df["Subject"] = df["Folder"].apply(extract_subject_id)
     rows = []
-    for subject_id, g in df.groupby("Subject", sort=False):
+    
+    # 【修改 1】：改為依照 Folder 分組處理，避免訊號濾波跨越片段
+    for folder_name, g in df.groupby("Folder", sort=False):
+        subject_id = g["Subject"].iloc[0]
         effective_id = f"{source_name}_{subject_id}" if source_name else subject_id
-        print(f"  Processing subject {effective_id}")
+        print(f"  Processing folder {folder_name} (Subject {effective_id})")
+        
         R = g["COLOR_R"].values.astype(float)
         G = g["COLOR_G"].values.astype(float)
         B = g["COLOR_B"].values.astype(float)
         SPO2 = g["SPO2"].values.astype(float)
         N = len(g)
 
-        # 至少需要 MIN_RPPG_FRAMES + WIN_LEN 才能產出特徵
         if N < MIN_RPPG_FRAMES + WIN_LEN:
-            print(f"    Skipped: insufficient frames ({N} < {MIN_RPPG_FRAMES + WIN_LEN})")
+            print(f"    Skipped: insufficient frames in folder ({N})")
             continue
 
-        # --- Step 1: 用 POS 算 rPPG --- 
         r_norm = R / 255.0
         g_norm = G / 255.0
         b_norm = B / 255.0
@@ -208,7 +205,6 @@ def build_features_from_df(df, source_name=None):
             print(f"    Skipped: POS algorithm failed")
             continue
 
-        # --- Step 2: 每隔 HR_UPDATE_SEC 秒計算一次 HR（用最近 MIN_RPPG_FRAMES 的 rPPG）---
         hr_update_interval = HR_UPDATE_SEC * FS
         hr_update_frames = list(range(MIN_RPPG_FRAMES, N, hr_update_interval))
         hr_list = []
@@ -217,9 +213,7 @@ def build_features_from_df(df, source_name=None):
             rppg_seg = raw_rppg[0, rppg_start:uf]
             hr, _, _, _ = calculate_hr_score(rppg_seg, FS)
             hr_list.append(hr)
-        print(f"    N={N}, HR updates={len(hr_list)}, HR values={[f'{h:.1f}' for h in hr_list]}")
 
-        # --- Step 3: 逐 epoch 帶通濾波 RGB ---
         r_filtered = np.zeros(N)
         g_filtered = np.zeros(N)
         b_filtered = np.zeros(N)
@@ -229,46 +223,37 @@ def build_features_from_df(df, source_name=None):
             ep_start = epoch_edges[ei]
             ep_end = epoch_edges[ei + 1]
             hr = hr_list[ei]
-
-            lo = hr / 60.0 - BW
+            lo = max(0.05, hr / 60.0 - BW)
             hi = hr / 60.0 + BW
-            if lo <= 0:
-                lo = 0.05  # 防止負頻率
 
             try:
                 r_filt = butter_filter(R, fs=FS, cutoff=[lo, hi], btype='band')
                 g_filt = butter_filter(G, fs=FS, cutoff=[lo, hi], btype='band')
                 b_filt = butter_filter(B, fs=FS, cutoff=[lo, hi], btype='band')
             except Exception as e:
-                print(f"    Warning: bandpass failed (HR={hr:.1f}, band=[{lo:.2f},{hi:.2f}]): {e}")
                 continue
 
-            # 第一個 epoch 往前延伸 WIN_LEN-1 筆，讓第一個滑窗完整覆蓋
             fill_start = max(0, ep_start - WIN_LEN + 1) if ei == 0 else ep_start
             r_filtered[fill_start:ep_end] = r_filt[fill_start:ep_end]
             g_filtered[fill_start:ep_end] = g_filt[fill_start:ep_end]
             b_filtered[fill_start:ep_end] = b_filt[fill_start:ep_end]
 
-        # --- Step 4: 逐 frame 滑窗計算 AC/DC ---
-        # 第一個輸出對應 frame MIN_RPPG_FRAMES（window 的最後一格）
         first_start = max(0, MIN_RPPG_FRAMES - WIN_LEN + 1)
-        n_rows_before = len(rows)
         for start in range(first_start, N - WIN_LEN + 1, STEP):
             end = start + WIN_LEN
             y = float(SPO2[end - 1])
 
-            row = {"subject_id": effective_id, "SPO2_win_mean": y}
+            # 【修改 2】：將 folder_name 也存入特徵中
+            row = {"subject_id": effective_id, "folder_name": folder_name, "SPO2_win_mean": y}
             for ch_name, filt_arr, orig_arr in [("R", r_filtered, R),
                                                   ("G", g_filtered, G),
                                                   ("B", b_filtered, B)]:
                 ac = np.std(filt_arr[start:end])
                 dc = np.mean(orig_arr[start:end])
                 row[f"{ch_name}_acdc"] = (ac / dc) if dc >= 1e-6 else 0.0
-                row[f"{ch_name}_mean"] = float(orig_arr[end - 1])  # 存該幀的原始 RGB 值，段級再取平均
+                row[f"{ch_name}_mean"] = float(orig_arr[end - 1])
             rows.append(row)
-
-        n_new = len(rows) - n_rows_before
-        print(f"    Generated {n_new} rows (first output at frame {MIN_RPPG_FRAMES}, {MIN_RPPG_FRAMES} frames skipped)")
+            
     return rows
 
 
@@ -379,104 +364,126 @@ def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH,
                      use_normalization=USE_NORMALIZATION, use_regularization=USE_REGULARIZATION, alpha=ALPHA,
                      min_train_r2=MIN_TRAIN_R2, min_train_pcc=MIN_TRAIN_PCC):
     """
-    訓練所有 subject 的模型並建構模型池（使用段切分策略）。
-    回傳 model_pool: list of dict（每項含 subject_id, segment_id, model_id, model, feature_cols, weights, bias, means, stds, X_raw_segment）。
+    訓練所有 subject 的模型並建構模型池（使用 Folder 獨立切分策略）。
+    回傳 model_pool: list of dict（每項含 subject_id, folder_name, segment_id, model_id, model, feature_cols, weights, bias, means, stds, X_raw_segment）。
     """
     print("\n" + "=" * 60)
-    print(f"訓練模型池（段長度={segment_length}）...")
+    print(f"訓練模型池（段長度={segment_length}，依 Folder 獨立切割）...")
     print("=" * 60)
+    
     if selected_channels is None:
         used_channels = all_channel_names
     else:
         used_channels = [ch for ch in selected_channels if ch in all_channel_names]
+        
     feature_cols = [f"{ch}_acdc" for ch in used_channels]
-    feat_df_selected = feat_df[["subject_id", "SPO2_win_mean"] + feature_cols + rgb_mean_col_names].copy()
+    
+    # 確保特徵中包含 folder_name
+    req_cols = ["subject_id", "folder_name", "SPO2_win_mean"] + feature_cols + rgb_mean_col_names
+    if "folder_name" not in feat_df.columns:
+        raise ValueError("特徵 DataFrame 缺少 'folder_name' 欄位，請確認 build_features_from_df 是否已更新！")
+        
+    feat_df_selected = feat_df[req_cols].copy()
 
     model_pool = []
     total_segments = 0
-    skipped_subjects = 0
+    skipped_folders = 0
     filtered_by_pcc = 0
     filtered_by_r2 = 0
 
+    # 第一層：依照 subject_id 分組
     for subject_id, subdf in feat_df_selected.groupby("subject_id", sort=False):
-        n_samples = len(subdf)
-        print(f"\n處理 Subject {subject_id}: {n_samples} 個樣本")
-        if n_samples < segment_length:
-            print(f"  跳過: 樣本數不足 {segment_length}，實際只有 {n_samples}")
-            skipped_subjects += 1
-            continue
-        n_segments = n_samples // segment_length
-        print(f"  可切分為 {n_segments} 段")
-        X_full = subdf[feature_cols].astype(float)
-        rgb_mean_full = subdf[rgb_mean_col_names].astype(float)
-        y_full = subdf["SPO2_win_mean"].values.astype(float)
-
-        for seg_idx in range(n_segments):
-            start_idx = seg_idx * segment_length
-            end_idx = start_idx + segment_length
-            X_raw_segment = X_full.iloc[start_idx:end_idx].copy()
-            y_segment = y_full[start_idx:end_idx]
-            # 段級 RGB 均值向量（用於 model selection）
-            rgb_mean_segment = rgb_mean_full.iloc[start_idx:end_idx].mean(axis=0).values
-            stds = X_raw_segment.std(axis=0)
-            if (stds < 1e-8).any():
-                constant_cols = X_raw_segment.columns[stds < 1e-8].tolist()
-                print(f"  段 {seg_idx}: 跳過（有常數特徵: {constant_cols}）")
+        n_samples_sub = len(subdf)
+        print(f"\n處理 Subject {subject_id}: 總共 {n_samples_sub} 個樣本")
+        
+        # 第二層：依照 folder_name (片段) 分組，確保 Segment 不跨 Folder
+        for folder_name, folder_df in subdf.groupby("folder_name", sort=False):
+            n_samples = len(folder_df)
+            if n_samples < segment_length:
+                print(f"  跳過 Folder {folder_name}: 樣本數不足 {segment_length} (僅 {n_samples})")
+                skipped_folders += 1
                 continue
+                
+            n_segments = n_samples // segment_length
+            print(f"  Folder {folder_name}: {n_samples} 樣本，可切為 {n_segments} 段")
+            
+            X_full = folder_df[feature_cols].astype(float)
+            rgb_mean_full = folder_df[rgb_mean_col_names].astype(float)
+            y_full = folder_df["SPO2_win_mean"].values.astype(float)
 
-            if use_normalization:
-                means = X_raw_segment.mean(axis=0)
+            for seg_idx in range(n_segments):
+                start_idx = seg_idx * segment_length
+                end_idx = start_idx + segment_length
+                
+                X_raw_segment = X_full.iloc[start_idx:end_idx].copy()
+                y_segment = y_full[start_idx:end_idx]
+                rgb_mean_segment = rgb_mean_full.iloc[start_idx:end_idx].mean(axis=0).values
+                
                 stds = X_raw_segment.std(axis=0)
-                X_normalized = (X_raw_segment - means) / stds
-            else:
-                means = None
-                stds = None
-                X_normalized = X_raw_segment
+                if (stds < 1e-8).any():
+                    constant_cols = X_raw_segment.columns[stds < 1e-8].tolist()
+                    print(f"    段 {seg_idx}: 跳過（有常數特徵: {constant_cols}）")
+                    continue
 
-            if use_regularization:
-                from sklearn.linear_model import Ridge
-                lr = Ridge(alpha=alpha)
-            else:
-                lr = LinearRegression()
-            lr.fit(X_normalized, y_segment)
-            y_pred = lr.predict(X_normalized)
-            train_r2 = r2_score(y_segment, y_pred)
-            if np.isnan(train_r2):
-                train_r2 = -1.0
-            if np.std(y_pred) < 1e-8 or np.std(y_segment) < 1e-8:
-                train_pcc = -1.0
-            else:
-                train_pcc, _ = pearsonr(y_segment, y_pred)
-                train_pcc = train_pcc if not np.isnan(train_pcc) else -1.0
+                if use_normalization:
+                    means = X_raw_segment.mean(axis=0)
+                    stds = X_raw_segment.std(axis=0)
+                    X_normalized = (X_raw_segment - means) / stds
+                else:
+                    means = None
+                    stds = None
+                    X_normalized = X_raw_segment
 
-            if train_r2 <= min_train_r2:
-                print(f"  段 {seg_idx}: 跳過（訓練集 R² = {train_r2:.4f} <= {min_train_r2}）")
-                filtered_by_r2 += 1
-                continue
-            if train_pcc <= min_train_pcc:
-                print(f"  段 {seg_idx}: 跳過（訓練集 PCC = {train_pcc:.4f} <= {min_train_pcc}）")
-                filtered_by_pcc += 1
-                continue
+                if use_regularization:
+                    from sklearn.linear_model import Ridge
+                    lr = Ridge(alpha=alpha)
+                else:
+                    lr = LinearRegression()
+                    
+                lr.fit(X_normalized, y_segment)
+                y_pred = lr.predict(X_normalized)
+                
+                train_r2 = r2_score(y_segment, y_pred)
+                if np.isnan(train_r2):
+                    train_r2 = -1.0
+                    
+                if np.std(y_pred) < 1e-8 or np.std(y_segment) < 1e-8:
+                    train_pcc = -1.0
+                else:
+                    train_pcc, _ = pearsonr(y_segment, y_pred)
+                    train_pcc = train_pcc if not np.isnan(train_pcc) else -1.0
 
-            model_id = f"{subject_id}_seg{seg_idx}"
-            model_pool.append({
-                'subject_id': subject_id,
-                'segment_id': seg_idx,
-                'model_id': model_id,
-                'model': lr,
-                'feature_cols': X_raw_segment.columns.tolist(),
-                'weights': lr.coef_,
-                'bias': lr.intercept_,
-                'means': means.values if means is not None else None,
-                'stds': stds.values if stds is not None else None,
-                'X_raw_segment': X_raw_segment.values,
-                'rgb_mean_segment': rgb_mean_segment,  # 段級 RGB 均值 (3,)
-            })
-            total_segments += 1
-        print(f"  Subject {subject_id} 完成: 訓練了 {n_segments} 個模型")
+                if train_r2 <= min_train_r2:
+                    print(f"    段 {seg_idx}: 跳過（訓練集 R² = {train_r2:.4f} <= {min_train_r2}）")
+                    filtered_by_r2 += 1
+                    continue
+                if train_pcc <= min_train_pcc:
+                    print(f"    段 {seg_idx}: 跳過（訓練集 PCC = {train_pcc:.4f} <= {min_train_pcc}）")
+                    filtered_by_pcc += 1
+                    continue
+
+                # 修改 model_id，加入 folder_name 確保唯一性與可讀性
+                model_id = f"{subject_id}_{folder_name}_seg{seg_idx}"
+                model_pool.append({
+                    'subject_id': subject_id,
+                    'folder_name': folder_name,
+                    'segment_id': seg_idx,
+                    'model_id': model_id,
+                    'model': lr,
+                    'feature_cols': X_raw_segment.columns.tolist(),
+                    'weights': lr.coef_,
+                    'bias': lr.intercept_,
+                    'means': means.values if means is not None else None,
+                    'stds': stds.values if stds is not None else None,
+                    'X_raw_segment': X_raw_segment.values,
+                    'rgb_mean_segment': rgb_mean_segment,
+                })
+                total_segments += 1
+        print(f"  Subject {subject_id} 完成")
 
     print(f"\n模型池建構完成:")
     print(f"  最終模型池大小: {len(model_pool)} 個模型")
+    print(f"  過濾統計: R²不足({filtered_by_r2}), PCC不足({filtered_by_pcc})")
     print("=" * 60)
     return model_pool
 
@@ -486,134 +493,174 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                                   use_normalization=USE_NORMALIZATION,
                                   save_plots=False, output_dir=OUTPUT_DIR):
     """
-    使用 ensemble 模型池進行預測與評估。回傳 (results_df, overall_pcc)。
+    使用 ensemble 模型池進行預測與評估。確保測試段也不跨越 Folder。
+    回傳 (results_df, overall_pcc)。
     """
     print("\n" + "=" * 60)
-    print(f"使用 Ensemble 模型池進行預測 (TOP_K={top_k}, 段長度={segment_length})...")
+    print(f"使用 Ensemble 模型池進行預測 (TOP_K={top_k}, 段長度={segment_length}, 依 Folder 獨立)...")
     print("=" * 60)
+    
     if selected_channels is None:
         used_channels = all_channel_names
     else:
         used_channels = [ch for ch in selected_channels if ch in all_channel_names]
+        
     feature_cols = [f"{ch}_acdc" for ch in used_channels]
-    feat_df_selected = feat_df[["subject_id", "SPO2_win_mean"] + feature_cols + rgb_mean_col_names].copy()
+    req_cols = ["subject_id", "folder_name", "SPO2_win_mean"] + feature_cols + rgb_mean_col_names
+    feat_df_selected = feat_df[req_cols].copy()
 
     results = []
     all_subjects_predictions = []
     all_subjects_labels = []
 
+    # 第一層：依照 subject_id 進行推論評估
     for test_subject_id, test_subdf in feat_df_selected.groupby("subject_id", sort=False):
-        n_samples = len(test_subdf)
-        print(f"\n測試 Subject {test_subject_id}: {n_samples} 個樣本")
-        if n_samples < segment_length:
-            print(f"  跳過: 樣本數不足 {segment_length}")
-            continue
-        X_test_full = test_subdf[feature_cols].astype(float)
-        rgb_mean_test_full = test_subdf[rgb_mean_col_names].astype(float)
-        y_test_full = test_subdf["SPO2_win_mean"].values.astype(float)
-        n_test_segments = n_samples // segment_length
-        print(f"  可切分為 {n_test_segments} 段")
+        n_samples_sub = len(test_subdf)
+        print(f"\n測試 Subject {test_subject_id}: 總共 {n_samples_sub} 個樣本")
+        
+        subject_segment_predictions = []
+        subject_segment_labels = []
 
-        all_segment_predictions = []
-        all_segment_labels = []
-
-        for test_seg_idx in range(n_test_segments):
-            start_idx = test_seg_idx * segment_length
-            end_idx = start_idx + segment_length
-            X_test_segment_df = X_test_full.iloc[start_idx:end_idx].copy()
-            y_test_segment = y_test_full[start_idx:end_idx]
-            test_stds = X_test_segment_df.std(axis=0)
-            if (test_stds < 1e-8).any():
-                constant_cols = X_test_segment_df.columns[test_stds < 1e-8].tolist()
-                print(f"  測試段 {test_seg_idx}: 跳過（有常數特徵: {constant_cols}）")
+        # 第二層：依照 folder_name 切分，避免測試資料的特徵跨越 Folder 縫合處
+        for folder_name, folder_df in test_subdf.groupby("folder_name", sort=False):
+            n_samples = len(folder_df)
+            if n_samples < segment_length:
+                # 若這一個 Folder 太短，直接跳過這段
                 continue
-            X_test_segment_array = X_test_segment_df.values
-            # 測試段的 RGB 均值向量
-            rgb_mean_test_segment = rgb_mean_test_full.iloc[start_idx:end_idx].mean(axis=0).values
-            similarities = []
-            for model_info in model_pool:
-                if model_info['subject_id'] == test_subject_id:
-                    continue
-                X_train_segment = model_info['X_raw_segment']
-                weights = model_info['weights']
-                shape_score, range_score = calculate_similarity(X_train_segment, X_test_segment_array, weights)
-                rgb_score = calculate_rgb_similarity(model_info['rgb_mean_segment'], rgb_mean_test_segment)
-                similarities.append({
-                    'model_info': model_info,
-                    'shape_score': shape_score,
-                    'range_score': range_score,
-                    'rgb_score': rgb_score,
-                    'model_id': model_info['model_id']
-                })
-            if len(similarities) == 0:
-                print(f"  測試段 {test_seg_idx}: 沒有可用模型")
-                continue
-
-            M = 2 * top_k
-            similarities.sort(key=lambda x: x['shape_score'], reverse=True)
-            top_m_candidates = similarities[:min(M, len(similarities))]
-            # 第二階段：range_score + RGB_SIM_WEIGHT * rgb_score 組合排序
-            top_m_candidates.sort(key=lambda x: x['range_score'] + RGB_SIM_WEIGHT * x['rgb_score'], reverse=True)
-            top_k_models = top_m_candidates[:min(top_k, len(top_m_candidates))]
-            if test_seg_idx == 0:
-                print(f"  測試段 {test_seg_idx} 選擇的 TOP_{min(top_k, len(top_k_models))} 模型:")
-                for rank, sim_info in enumerate(top_k_models, 1):
-                    print(f"    {rank}. {sim_info['model_id']}, shape: {sim_info['shape_score']:.4f}, range: {sim_info['range_score']:.4f}, rgb: {sim_info['rgb_score']:.4f}")
-
-            if use_normalization:
-                test_means = X_test_segment_df.mean(axis=0)
+                
+            n_test_segments = n_samples // segment_length
+            X_test_full = folder_df[feature_cols].astype(float)
+            rgb_mean_test_full = folder_df[rgb_mean_col_names].astype(float)
+            y_test_full = folder_df["SPO2_win_mean"].values.astype(float)
+            
+            for test_seg_idx in range(n_test_segments):
+                start_idx = test_seg_idx * segment_length
+                end_idx = start_idx + segment_length
+                
+                X_test_segment_df = X_test_full.iloc[start_idx:end_idx].copy()
+                y_test_segment = y_test_full[start_idx:end_idx]
+                
                 test_stds = X_test_segment_df.std(axis=0)
-                X_test_normalized = (X_test_segment_df - test_means) / test_stds
-            else:
-                X_test_normalized = X_test_segment_df
+                if (test_stds < 1e-8).any():
+                    constant_cols = X_test_segment_df.columns[test_stds < 1e-8].tolist()
+                    print(f"  測試段 {folder_name}_seg{test_seg_idx}: 跳過（有常數特徵: {constant_cols}）")
+                    continue
+                    
+                X_test_segment_array = X_test_segment_df.values
+                rgb_mean_test_segment = rgb_mean_test_full.iloc[start_idx:end_idx].mean(axis=0).values
+                
+                similarities = []
+                for model_info in model_pool:
+                    # Leave-One-Subject-Out: 不能使用同一個受試者的模型
+                    if model_info['subject_id'] == test_subject_id:
+                        continue
+                        
+                    X_train_segment = model_info['X_raw_segment']
+                    weights = model_info['weights']
+                    
+                    shape_score, range_score = calculate_similarity(X_train_segment, X_test_segment_array, weights)
+                    rgb_score = calculate_rgb_similarity(model_info['rgb_mean_segment'], rgb_mean_test_segment)
+                    
+                    similarities.append({
+                        'model_info': model_info,
+                        'shape_score': shape_score,
+                        'range_score': range_score,
+                        'rgb_score': rgb_score,
+                        'model_id': model_info['model_id']
+                    })
+                    
+                if len(similarities) == 0:
+                    print(f"  測試段 {folder_name}_seg{test_seg_idx}: 沒有可用模型")
+                    continue
 
-            segment_predictions = []
-            for sim_info in top_k_models:
-                model_info = sim_info['model_info']
-                weights = model_info['weights']
-                bias = model_info['bias']
-                feature_cols_model = model_info['feature_cols']
-                X_test_normalized_aligned = X_test_normalized[feature_cols_model].values
-                y_pred = np.dot(X_test_normalized_aligned, weights) + bias
-                segment_predictions.append(y_pred)
-            if len(segment_predictions) > 0:
-                y_segment_ensemble = np.mean(segment_predictions, axis=0)
-                all_segment_predictions.append(y_segment_ensemble)
-                all_segment_labels.append(y_test_segment)
+                # 篩選 TOP_K
+                M = 2 * top_k
+                similarities.sort(key=lambda x: x['shape_score'], reverse=True)
+                top_m_candidates = similarities[:min(M, len(similarities))]
+                
+                # 第二階段：range_score + RGB_SIM_WEIGHT * rgb_score 組合排序
+                top_m_candidates.sort(key=lambda x: x['range_score'] + RGB_SIM_WEIGHT * x['rgb_score'], reverse=True)
+                top_k_models = top_m_candidates[:min(top_k, len(top_m_candidates))]
+                
+                # 僅印出該受試者第一個測試段的被選模型狀態
+                if test_seg_idx == 0 and len(subject_segment_predictions) == 0:
+                    print(f"  首個測試段 {folder_name}_seg{test_seg_idx} 選擇的 TOP_{min(top_k, len(top_k_models))} 模型:")
+                    for rank, sim_info in enumerate(top_k_models, 1):
+                        print(f"    {rank}. {sim_info['model_id']}, shape: {sim_info['shape_score']:.4f}, range: {sim_info['range_score']:.4f}, rgb: {sim_info['rgb_score']:.4f}")
 
-        if len(all_segment_predictions) == 0:
+                # 正規化
+                if use_normalization:
+                    test_means = X_test_segment_df.mean(axis=0)
+                    test_stds = X_test_segment_df.std(axis=0)
+                    X_test_normalized = (X_test_segment_df - test_means) / test_stds
+                else:
+                    X_test_normalized = X_test_segment_df
+
+                # 預測
+                segment_predictions = []
+                for sim_info in top_k_models:
+                    model_info = sim_info['model_info']
+                    weights = model_info['weights']
+                    bias = model_info['bias']
+                    feature_cols_model = model_info['feature_cols']
+                    
+                    X_test_normalized_aligned = X_test_normalized[feature_cols_model].values
+                    y_pred = np.dot(X_test_normalized_aligned, weights) + bias
+                    segment_predictions.append(y_pred)
+                    
+                if len(segment_predictions) > 0:
+                    y_segment_ensemble = np.mean(segment_predictions, axis=0)
+                    subject_segment_predictions.append(y_segment_ensemble)
+                    subject_segment_labels.append(y_test_segment)
+
+        # 針對整個 Subject 的所有預測片段做計算
+        if len(subject_segment_predictions) == 0:
             print(f"  跳過 Subject {test_subject_id}: 沒有成功預測的段")
             continue
 
-        y_ensemble = np.concatenate(all_segment_predictions)
-        y_test = np.concatenate(all_segment_labels)
+        y_ensemble = np.concatenate(subject_segment_predictions)
+        y_test = np.concatenate(subject_segment_labels)
+        
         r2 = r2_score(y_test, y_ensemble)
         mae = mean_absolute_error(y_test, y_ensemble)
         pcc = np.nan if np.std(y_ensemble) < 1e-8 else pearsonr(y_test, y_ensemble)[0]
+        
         results.append({
             "subject_id": test_subject_id,
             "n_frames": len(y_test),
-            "n_segments": len(all_segment_predictions),
+            "n_segments": len(subject_segment_predictions),
             "n_models_used": top_k,
             "R2": r2,
             "MAE": mae,
             "PCC": pcc
         })
-        print(f"  R² = {r2:.4f}, MAE = {mae:.4f}, PCC = {pcc if not np.isnan(pcc) else 0:.4f}")
+        print(f"  完成推論：R² = {r2:.4f}, MAE = {mae:.4f}, PCC = {pcc if not np.isnan(pcc) else 0:.4f}")
         all_subjects_predictions.append(y_ensemble)
         all_subjects_labels.append(y_test)
 
+        # 繪圖
         if save_plots:
             plot_dir = os.path.join(output_dir, "sub_plot")
             os.makedirs(plot_dir, exist_ok=True)
-            plt.figure(figsize=(10, 5))
-            plt.plot(y_test, label="True SpO2", linewidth=1.5, color='black')
-            plt.plot(y_ensemble, label=f"Ensemble Prediction (TOP_{top_k})", linewidth=1.5, color='red', linestyle='--')
-            plt.title(f"Subject {test_subject_id} - Ensemble (TOP_K={top_k}, R²={r2:.3f}, MAE={mae:.2f}, PCC={pcc if not np.isnan(pcc) else 0:.3f})")
-            plt.xlabel("Frame index")
+            plt.figure(figsize=(12, 6))
+            
+            # 繪製真實值與預測值
+            plt.plot(y_test, label="True SpO2", linewidth=1.5, color='black', alpha=0.7)
+            plt.plot(y_ensemble, label=f"Ensemble (TOP_{top_k})", linewidth=1.5, color='red', linestyle='--')
+            
+            # --- 新增：繪製 Folder 邊界虛線 ---
+            current_pos = 0
+            # 這裡需要你在迴圈中記錄每個 folder 預測了多少個樣本
+            for seg_pred in subject_segment_predictions:
+                current_pos += len(seg_pred)
+                plt.axvline(x=current_pos, color='blue', linestyle=':', alpha=0.3)
+            # -------------------------------
+
+            plt.title(f"Subject {test_subject_id} - Segmented Evaluation\n(R²={r2:.3f}, MAE={mae:.2f}, PCC={pcc:.3f})")
+            plt.xlabel("Cumulative Valid Frames (Excluding discarded/skipped frames)")
             plt.ylabel("SpO2")
             plt.legend()
-            plt.grid(True, alpha=0.3)
+            plt.grid(True, alpha=0.2)
             output_path = os.path.join(plot_dir, f"vis_ensemble_{test_subject_id}_topk{top_k}.png")
             plt.savefig(output_path, dpi=120, bbox_inches='tight')
             plt.close()
@@ -628,6 +675,7 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
             print(f"總樣本數: {len(all_pred)}")
     else:
         overall_pcc = np.nan
+        
     results_df['overall_PCC'] = overall_pcc
     print("\n" + "=" * 60)
     print("Ensemble 預測完成")
