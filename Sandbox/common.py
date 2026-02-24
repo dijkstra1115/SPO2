@@ -493,8 +493,8 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                                   use_normalization=USE_NORMALIZATION,
                                   save_plots=False, output_dir=OUTPUT_DIR):
     """
-    使用 ensemble 模型池進行預測與評估。確保測試段也不跨越 Folder。
-    回傳 (results_df, overall_pcc)。
+    使用 ensemble 模型池進行預測與評估。
+    新增邏輯：不足 900 幀的結尾殘餘段落，直接沿用最後一次選出的 TOP_K 模型。
     """
     print("\n" + "=" * 60)
     print(f"使用 Ensemble 模型池進行預測 (TOP_K={top_k}, 段長度={segment_length}, 依 Folder 獨立)...")
@@ -513,7 +513,6 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
     all_subjects_predictions = []
     all_subjects_labels = []
 
-    # 第一層：依照 subject_id 進行推論評估
     for test_subject_id, test_subdf in feat_df_selected.groupby("subject_id", sort=False):
         n_samples_sub = len(test_subdf)
         print(f"\n測試 Subject {test_subject_id}: 總共 {n_samples_sub} 個樣本")
@@ -521,21 +520,25 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
         subject_segment_predictions = []
         subject_segment_labels = []
 
-        # 第二層：依照 folder_name 切分，避免測試資料的特徵跨越 Folder 縫合處
         for folder_name, folder_df in test_subdf.groupby("folder_name", sort=False):
             n_samples = len(folder_df)
-            if n_samples < segment_length:
-                # 若這一個 Folder 太短，直接跳過這段
+            # 如果連一個滑窗的長度都不夠，就真的沒救了
+            if n_samples < WIN_LEN:
                 continue
                 
             n_test_segments = n_samples // segment_length
+            total_segments = math.ceil(n_samples / segment_length) # 包含殘餘段落的總段數
+            
             X_test_full = folder_df[feature_cols].astype(float)
             rgb_mean_test_full = folder_df[rgb_mean_col_names].astype(float)
             y_test_full = folder_df["SPO2_win_mean"].values.astype(float)
             
-            for test_seg_idx in range(n_test_segments):
+            last_top_k_models = None # 用來記住上一段的 TOP_K 模型
+
+            for test_seg_idx in range(total_segments):
                 start_idx = test_seg_idx * segment_length
-                end_idx = start_idx + segment_length
+                # 確保 end_idx 不會超過總樣本數
+                end_idx = min(start_idx + segment_length, n_samples) 
                 
                 X_test_segment_df = X_test_full.iloc[start_idx:end_idx].copy()
                 y_test_segment = y_test_full[start_idx:end_idx]
@@ -545,48 +548,50 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                     constant_cols = X_test_segment_df.columns[test_stds < 1e-8].tolist()
                     print(f"  測試段 {folder_name}_seg{test_seg_idx}: 跳過（有常數特徵: {constant_cols}）")
                     continue
-                    
-                X_test_segment_array = X_test_segment_df.values
-                rgb_mean_test_segment = rgb_mean_test_full.iloc[start_idx:end_idx].mean(axis=0).values
                 
-                similarities = []
-                for model_info in model_pool:
-                    # Leave-One-Subject-Out: 不能使用同一個受試者的模型
-                    if model_info['subject_id'] == test_subject_id:
-                        continue
+                # 判斷是否需要「重新計算相似度並挑選模型」
+                # 條件 1：這是一段完整的 900 幀 (test_seg_idx < n_test_segments)
+                # 條件 2：這是第一段，但因為 Folder 總長度不足 900，所以沒有上一段可以沿用 (last_top_k_models is None)
+                if test_seg_idx < n_test_segments or last_top_k_models is None:
+                    X_test_segment_array = X_test_segment_df.values
+                    rgb_mean_test_segment = rgb_mean_test_full.iloc[start_idx:end_idx].mean(axis=0).values
+                    
+                    similarities = []
+                    for model_info in model_pool:
+                        if model_info['subject_id'] == test_subject_id:
+                            continue
+                            
+                        X_train_segment = model_info['X_raw_segment']
+                        weights = model_info['weights']
                         
-                    X_train_segment = model_info['X_raw_segment']
-                    weights = model_info['weights']
-                    
-                    shape_score, range_score = calculate_similarity(X_train_segment, X_test_segment_array, weights)
-                    rgb_score = calculate_rgb_similarity(model_info['rgb_mean_segment'], rgb_mean_test_segment)
-                    
-                    similarities.append({
-                        'model_info': model_info,
-                        'shape_score': shape_score,
-                        'range_score': range_score,
-                        'rgb_score': rgb_score,
-                        'model_id': model_info['model_id']
-                    })
-                    
-                if len(similarities) == 0:
-                    print(f"  測試段 {folder_name}_seg{test_seg_idx}: 沒有可用模型")
-                    continue
+                        shape_score, range_score = calculate_similarity(X_train_segment, X_test_segment_array, weights)
+                        rgb_score = calculate_rgb_similarity(model_info['rgb_mean_segment'], rgb_mean_test_segment)
+                        
+                        similarities.append({
+                            'model_info': model_info,
+                            'shape_score': shape_score,
+                            'range_score': range_score,
+                            'rgb_score': rgb_score,
+                            'model_id': model_info['model_id']
+                        })
+                        
+                    if len(similarities) == 0:
+                        print(f"  測試段 {folder_name}_seg{test_seg_idx}: 沒有可用模型")
+                        continue
 
-                # 篩選 TOP_K
-                M = 2 * top_k
-                similarities.sort(key=lambda x: x['shape_score'], reverse=True)
-                top_m_candidates = similarities[:min(M, len(similarities))]
-                
-                # 第二階段：range_score + RGB_SIM_WEIGHT * rgb_score 組合排序
-                top_m_candidates.sort(key=lambda x: x['range_score'] + RGB_SIM_WEIGHT * x['rgb_score'], reverse=True)
-                top_k_models = top_m_candidates[:min(top_k, len(top_m_candidates))]
-                
-                # 僅印出該受試者第一個測試段的被選模型狀態
-                if test_seg_idx == 0 and len(subject_segment_predictions) == 0:
-                    print(f"  首個測試段 {folder_name}_seg{test_seg_idx} 選擇的 TOP_{min(top_k, len(top_k_models))} 模型:")
-                    for rank, sim_info in enumerate(top_k_models, 1):
-                        print(f"    {rank}. {sim_info['model_id']}, shape: {sim_info['shape_score']:.4f}, range: {sim_info['range_score']:.4f}, rgb: {sim_info['rgb_score']:.4f}")
+                    M = 2 * top_k
+                    similarities.sort(key=lambda x: x['shape_score'], reverse=True)
+                    top_m_candidates = similarities[:min(M, len(similarities))]
+                    top_m_candidates.sort(key=lambda x: x['range_score'] + RGB_SIM_WEIGHT * x['rgb_score'], reverse=True)
+                    top_k_models = top_m_candidates[:min(top_k, len(top_m_candidates))]
+                    
+                    # 把這組挑出來的模型存起來，如果下一段是殘餘段落就可以直接用
+                    last_top_k_models = top_k_models 
+                    
+                else:
+                    # 這裡是不足 900 的殘餘段落，直接沿用
+                    top_k_models = last_top_k_models
+                    print(f"  測試段 {folder_name}_seg{test_seg_idx} (殘餘 {end_idx - start_idx} 幀): 沿用上一段的 TOP_{top_k} 模型")
 
                 # 正規化
                 if use_normalization:
@@ -613,7 +618,6 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                     subject_segment_predictions.append(y_segment_ensemble)
                     subject_segment_labels.append(y_test_segment)
 
-        # 針對整個 Subject 的所有預測片段做計算
         if len(subject_segment_predictions) == 0:
             print(f"  跳過 Subject {test_subject_id}: 沒有成功預測的段")
             continue
@@ -634,33 +638,28 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
             "MAE": mae,
             "PCC": pcc
         })
-        print(f"  完成推論：R² = {r2:.4f}, MAE = {mae:.4f}, PCC = {pcc if not np.isnan(pcc) else 0:.4f}")
+        print(f"  完成推論：累積 {len(y_test)} 幀, R² = {r2:.4f}, MAE = {mae:.4f}, PCC = {pcc if not np.isnan(pcc) else 0:.4f}")
         all_subjects_predictions.append(y_ensemble)
         all_subjects_labels.append(y_test)
 
-        # 繪圖
         if save_plots:
             plot_dir = os.path.join(output_dir, "sub_plot")
             os.makedirs(plot_dir, exist_ok=True)
-            plt.figure(figsize=(12, 6))
+            plt.figure(figsize=(12, 5))
+            plt.plot(y_test, label="True SpO2", linewidth=1.5, color='black')
+            plt.plot(y_ensemble, label=f"Ensemble Prediction", linewidth=1.5, color='red', linestyle='--')
             
-            # 繪製真實值與預測值
-            plt.plot(y_test, label="True SpO2", linewidth=1.5, color='black', alpha=0.7)
-            plt.plot(y_ensemble, label=f"Ensemble (TOP_{top_k})", linewidth=1.5, color='red', linestyle='--')
-            
-            # --- 新增：繪製 Folder 邊界虛線 ---
+            # 畫出每個段落(包含沿用的殘餘段落)的邊界，方便查看
             current_pos = 0
-            # 這裡需要你在迴圈中記錄每個 folder 預測了多少個樣本
             for seg_pred in subject_segment_predictions:
                 current_pos += len(seg_pred)
                 plt.axvline(x=current_pos, color='blue', linestyle=':', alpha=0.3)
-            # -------------------------------
-
-            plt.title(f"Subject {test_subject_id} - Segmented Evaluation\n(R²={r2:.3f}, MAE={mae:.2f}, PCC={pcc:.3f})")
-            plt.xlabel("Cumulative Valid Frames (Excluding discarded/skipped frames)")
+                
+            plt.title(f"Subject {test_subject_id} - Ensemble (TOP_K={top_k}, R²={r2:.3f}, MAE={mae:.2f}, PCC={pcc if not np.isnan(pcc) else 0:.3f})")
+            plt.xlabel("Cumulative Frame index (Segment Boundaries marked by dotted lines)")
             plt.ylabel("SpO2")
             plt.legend()
-            plt.grid(True, alpha=0.2)
+            plt.grid(True, alpha=0.3)
             output_path = os.path.join(plot_dir, f"vis_ensemble_{test_subject_id}_topk{top_k}.png")
             plt.savefig(output_path, dpi=120, bbox_inches='tight')
             plt.close()
@@ -672,7 +671,7 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
         overall_pcc = np.nan if np.std(all_pred) < 1e-8 else pearsonr(all_labels, all_pred)[0]
         if not np.isnan(overall_pcc):
             print(f"\n所有 subject 串聯後的整體 PCC: {overall_pcc:.6f}")
-            print(f"總樣本數: {len(all_pred)}")
+            print(f"總預測樣本數: {len(all_pred)}")
     else:
         overall_pcc = np.nan
         
