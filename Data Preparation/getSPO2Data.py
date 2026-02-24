@@ -3,7 +3,7 @@ import numpy as np
 import os
 from typing import List, Optional
 
-DATA_DIR = "//169.254.2.1/Algorithm/PRC SpO2 (2025)"
+DATA_DIR = "//172.16.1.2/Algorithm/PRC SpO2 (2025)"
 DEVICE = "C930"
 META_FILE = "meta.csv"
 SPO2_MIN = 70

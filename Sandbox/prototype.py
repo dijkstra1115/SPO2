@@ -10,13 +10,13 @@ matplotlib.use('Agg')  # 使用非交互式后端，避免 tkinter 错误
 import matplotlib.pyplot as plt
 
 # Config
-WIN_LEN = 1
+WIN_LEN = 60
 STEP = 1
 OUTPUT_DIR = "./output"  # 输出目录
 SAVE_PLOTS = False  # 是否保存每个 subject 的预测图
 
 # Normalization 参数
-USE_NORMALIZATION = True  # 是否使用归一化
+USE_NORMALIZATION = False  # 是否使用归一化
 
 # 正则化参数
 USE_REGULARIZATION = False  # 是否使用正则化
@@ -25,6 +25,13 @@ ALPHA = 1.0  # 正则化强度 (alpha)
 # Ensemble 模型池配置
 TOP_K = 5  # 从其他模型中选择 TOP_K 个最相似的模型进行 ensemble
 SEGMENT_LENGTH = 900  # 每个模型训练时使用的固定样本数（段长度）
+
+# 多 CSV 擴大模型池：可一次加入多個 .csv，合併後訓練與評估
+DATA_CSV_PATHS = [
+    "./data/prc-c920.csv",
+    "./data/prc-i15.csv",
+    "./data/prc-i15m.csv",
+]
 
 # 创建输出目录
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -43,43 +50,63 @@ def getsixchannels(rgb):
     chrom_x =   3*rgb[0, :] - 2*rgb[1, :]
     return [ycgcr_cg, ycgcr_cr, yiq_i, ydbdr_dr, pos_y, chrom_x]
 
-# Load raw data
-df = pd.read_csv("./data/prc-c920.csv")
+# getsixchannels 回傳的固定順序，用於依名稱取對應通道
+CHANNEL_ORDER = ["cg", "cr", "yiq_i", "dbdr_dr", "pos_y", "chrom_x"]
+all_channel_names = ["cg", "cr", "yiq_i"]
 
-# 提取 Subject ID
-df['Subject'] = df['Folder'].apply(extract_subject_id)
 
-all_channel_names = ["cg", "cr", "yiq_i", "dbdr_dr", "pos_y", "chrom_x"]
+def build_features_from_df(df, source_name=None):
+    """
+    從單一 CSV 的 DataFrame 建特徵。若給定 source_name，會將 subject_id 前綴為 source_name_subject_id 以區分不同檔案。
+    回傳 list of dict（每筆一 row）。
+    """
+    df = df.copy()
+    df["Subject"] = df["Folder"].apply(extract_subject_id)
+    rows = []
+    for subject_id, g in df.groupby("Subject", sort=False):
+        effective_id = f"{source_name}_{subject_id}" if source_name else subject_id
+        print(f"  Processing subject {effective_id}")
+        R = g["COLOR_R"].values.astype(float)
+        G = g["COLOR_G"].values.astype(float)
+        B = g["COLOR_B"].values.astype(float)
+        SPO2 = g["SPO2"].values.astype(float)
+        N = len(g)
+        if N < WIN_LEN:
+            continue
+        rgb = np.vstack([R, G, B])
+        six = getsixchannels(rgb)
+        for start in range(0, N - WIN_LEN + 1, STEP):
+            end = start + WIN_LEN
+            y = float(SPO2[start:end].mean())
+            row = {"subject_id": effective_id, "SPO2_win_mean": y}
+            for name in all_channel_names:
+                six_idx = CHANNEL_ORDER.index(name)
+                ch_segment = six[six_idx][start:end]
+                dc = ch_segment.mean()
+                ac = ch_segment.std()
+                val = (ac / dc) if dc >= 1e-6 else 0
+                row[f"{name}_acdc"] = val
+            rows.append(row)
+    return rows
 
-# Build features once (包含所有通道)
+
+# 載入多個 CSV、合併特徵，擴大 model pool
 print("=" * 60)
-print("Processing all subjects and building features...")
+print("Loading CSV(s) and building features...")
 print("=" * 60)
-rows = []
-for subject_id, g in df.groupby("Subject", sort=False):
-    print(f"Processing subject {subject_id}")
-    R = g["COLOR_R"].values.astype(float)
-    G = g["COLOR_G"].values.astype(float)
-    B = g["COLOR_B"].values.astype(float)
-    SPO2 = g["SPO2"].values.astype(float)
-    N = len(g)
-    if N < WIN_LEN: continue
+all_rows = []
+for csv_path in DATA_CSV_PATHS:
+    if not os.path.isfile(csv_path):
+        print(f"Skip (file not found): {csv_path}")
+        continue
+    print(f"File: {csv_path}")
+    df = pd.read_csv(csv_path)
+    source_name = os.path.splitext(os.path.basename(csv_path))[0]
+    all_rows.extend(build_features_from_df(df, source_name=source_name))
 
-    rgb = np.vstack([R, G, B])
-    six = getsixchannels(rgb)
-    
-    # 构建所有通道的特征
-    for start in range(0, N - WIN_LEN + 1, STEP):
-        end = start + WIN_LEN
-        y = float(SPO2[start:end].mean())
-        row = {"subject_id": subject_id, "SPO2_win_mean": y}
-        for idx, name in zip(range(len(all_channel_names)), all_channel_names):
-            ch = six[idx]
-            row[f"{name}_mean"] = ch[start:end].mean()
-        rows.append(row)
-
-feat_df_all = pd.DataFrame(rows)
+feat_df_all = pd.DataFrame(all_rows)
 print(f"Feature building completed. Total samples: {len(feat_df_all)}")
+print(f"Total subjects: {feat_df_all['subject_id'].nunique()}")
 print("=" * 60)
 
 def calculate_ccc(y_true, y_pred):
@@ -173,9 +200,9 @@ def calculate_similarity(features_model, features_test, weights_model):
     
     n_samples, n_features = features_model.shape
     
-    # 检查特征数量是否为 6
-    if n_features != 6:
-        print(f"  警告: 期望 6 个特征，实际得到 {n_features} 个")
+    # 特征数量需与权重一致（支持任意通道数，不限于 6）
+    if len(weights_model) != n_features:
+        print(f"  警告: 特征数 {n_features} 与权重数 {len(weights_model)} 不一致")
         return -1.0, -1.0
     
     # 计算权重的绝对值（用于加权平均）
@@ -280,8 +307,8 @@ def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH):
         used_channels = [ch for ch in selected_channels if ch in all_channel_names]
         print(f"使用选定通道: {used_channels}")
     
-    # 选择特征列
-    feature_cols = [f"{ch}_mean" for ch in used_channels]
+    # 选择特征列（特征名为 通道_acdc）
+    feature_cols = [f"{ch}_acdc" for ch in used_channels]
     feat_df_selected = feat_df[["subject_id", "SPO2_win_mean"] + feature_cols].copy()
     
     model_pool = []
@@ -443,7 +470,7 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
     else:
         used_channels = [ch for ch in selected_channels if ch in all_channel_names]
     
-    feature_cols = [f"{ch}_mean" for ch in used_channels]
+    feature_cols = [f"{ch}_acdc" for ch in used_channels]
     feat_df_selected = feat_df[["subject_id", "SPO2_win_mean"] + feature_cols].copy()
     
     results = []
@@ -541,11 +568,13 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
             
             # 【关键修改】所有模型在「test subject 的座标系」下预测
             # Step 1: 计算 test subject 自己的 mean 和 std
-            test_means = X_test_segment_df.mean(axis=0)
-            test_stds = X_test_segment_df.std(axis=0)
-            
             # Step 2: 用 test subject 的 mean/std 做 normalization
-            X_test_normalized = (X_test_segment_df - test_means) / test_stds
+            if USE_NORMALIZATION:
+                test_means = X_test_segment_df.mean(axis=0)
+                test_stds = X_test_segment_df.std(axis=0)
+                X_test_normalized = (X_test_segment_df - test_means) / test_stds
+            else:
+                X_test_normalized = X_test_segment_df
             
             # 使用 TOP_K 模型进行预测
             segment_predictions = []
