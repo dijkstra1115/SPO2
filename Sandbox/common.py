@@ -41,6 +41,9 @@ BW = 0.2                # 帶通濾波帶寬 ±Hz
 MIN_TRAIN_R2 = 0.5
 MIN_TRAIN_PCC = 0.5
 
+# Subject 級 SpO2 跨幅篩選：僅保留「該 subject 所有 segment 串起來後」SpO2 最大最小值差值 >= 此值的 subject
+MIN_SPO2_RANGE = 10
+
 # 模型與設定儲存目錄（train.py 會寫入此目錄，infer.py 由此載入）
 MODEL_DIR = os.path.join(OUTPUT_DIR, "model")
 
@@ -277,6 +280,41 @@ def load_features_from_csv_paths(csv_paths, verbose=True):
         print(f"Feature building completed. Total samples: {len(feat_df)}")
         print(f"Total subjects: {feat_df['subject_id'].nunique()}")
     return feat_df
+
+
+def filter_feat_df_by_spo2_range(feat_df, min_range=MIN_SPO2_RANGE, segment_length=None, verbose=True):
+    """
+    依「同一 subject_id 下會被用來訓練/評估的 SpO2 跨幅」篩選 subject。
+    - 若提供 segment_length：只考慮「該 folder 樣本數 >= segment_length」的 rows 來算跨幅，
+      與後續 train/eval 實際使用的資料一致，避免通過篩選的 subject 在圖上只剩窄範圍。
+    - 僅保留跨幅 >= min_range 的 subject。
+    回傳篩選後的 DataFrame（不修改原 DataFrame）。
+    """
+    if "subject_id" not in feat_df.columns or "SPO2_win_mean" not in feat_df.columns:
+        return feat_df
+    if "folder_name" not in feat_df.columns and segment_length is not None:
+        segment_length = None  # 無法依 folder 過濾時退化成用全部 rows
+
+    if segment_length is not None:
+        # 只考慮「會被使用的」folder：該 folder 的 row 數 >= segment_length
+        folder_counts = feat_df.groupby("folder_name").size()
+        valid_folders = folder_counts.index[folder_counts >= segment_length].tolist()
+        df_for_range = feat_df[feat_df["folder_name"].isin(valid_folders)]
+    else:
+        df_for_range = feat_df
+
+    agg = df_for_range.groupby("subject_id")["SPO2_win_mean"].agg(["min", "max"])
+    agg["spo2_range"] = agg["max"] - agg["min"]
+    valid_subject_ids = agg.index[agg["spo2_range"] >= min_range].tolist()
+    dropped = agg.index[agg["spo2_range"] < min_range].tolist()
+    filtered = feat_df[feat_df["subject_id"].isin(valid_subject_ids)].copy()
+    if verbose:
+        print(f"SpO2 跨幅篩選 (min_range={min_range}, 僅計入長度>={segment_length or 'N/A'} 的 folder): 保留 {len(valid_subject_ids)} 個 subject，排除 {len(dropped)} 個 subject")
+        if dropped:
+            for sid in dropped:
+                r = agg.loc[sid, "spo2_range"]
+                print(f"  排除 subject_id={sid} (SpO2 跨幅={r:.2f})")
+    return filtered
 
 
 def calculate_ccc(y_true, y_pred):
@@ -611,7 +649,13 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
 
         y_ensemble = np.concatenate(subject_segment_predictions)
         y_test = np.concatenate(subject_segment_labels)
-        
+
+        # 防護：實際用於評估的資料跨幅若仍不足，跳過該 subject（不列入結果、不繪圖）
+        subject_range = float(np.max(y_test) - np.min(y_test))
+        if subject_range < MIN_SPO2_RANGE:
+            print(f"  跳過 Subject {test_subject_id}: 實際用於評估的 SpO2 跨幅={subject_range:.2f} < {MIN_SPO2_RANGE}，不列入結果與繪圖")
+            continue
+
         r2 = r2_score(y_test, y_ensemble)
         mae = mean_absolute_error(y_test, y_ensemble)
         pcc = np.nan if np.std(y_ensemble) < 1e-8 else pearsonr(y_test, y_ensemble)[0]

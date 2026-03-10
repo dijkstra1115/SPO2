@@ -11,6 +11,7 @@ from common import (
     OUTPUT_DIR,
     MODEL_DIR,
     load_features_from_csv_paths,
+    filter_feat_df_by_spo2_range,
     ensemble_predict_and_evaluate,
 )
 
@@ -71,6 +72,7 @@ def main():
         print("=" * 60)
 
         feat_df = load_features_from_csv_paths([csv_path], verbose=True)
+        feat_df = filter_feat_df_by_spo2_range(feat_df, segment_length=segment_length, verbose=True)
         if len(feat_df) == 0:
             print(f"  沒有樣本，跳過。")
             summary_rows.append({

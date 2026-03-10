@@ -1,0 +1,129 @@
+<mxfile host="app.diagrams.net" agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36" version="29.6.0">
+  <diagram id="Valhk4Vy3wTWdswZ9QOw" name="Page-1">
+    <mxGraphModel dx="1426" dy="743" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title1" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontStyle=1;fontSize=14;" value="Phase 1: Feature Engineering (Feature Building)&lt;br&gt;build_features_from_df" vertex="1">
+          <mxGeometry height="40" width="240" x="40" y="20" as="geometry" />
+        </mxCell>
+        <mxCell id="title2" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontStyle=1;fontSize=14;" value="Phase 2: Model Pool Training (train.py)&lt;br&gt;train_model_pool" vertex="1">
+          <mxGeometry height="40" width="240" x="380" y="20" as="geometry" />
+        </mxCell>
+        <mxCell id="title3" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontStyle=1;fontSize=14;" value="Phase 3: Ensemble Inference (infer.py)&lt;br&gt;ensemble_predict_and_evaluate" vertex="1">
+          <mxGeometry height="40" width="240" x="720" y="20" as="geometry" />
+        </mxCell>
+        <mxCell id="f1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;" value="Input RGB Video / CSV&lt;br&gt;(Grouped by Folder)" vertex="1">
+          <mxGeometry height="60" width="200" x="60" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="f2" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Extract rPPG Signal&lt;br&gt;(POS Algorithm)" vertex="1">
+          <mxGeometry height="60" width="200" x="60" y="180" as="geometry" />
+        </mxCell>
+        <mxCell id="f3" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Heart Rate (FFT) &amp;amp;&lt;br&gt;Bandpass Filter (Butterworth)" vertex="1">
+          <mxGeometry height="60" width="200" x="60" y="280" as="geometry" />
+        </mxCell>
+        <mxCell id="f4" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Rolling Window (Len=60)&lt;br&gt;Compute AC/DC &amp; RGB Mean" vertex="1">
+          <mxGeometry height="60" width="200" x="60" y="380" as="geometry" />
+        </mxCell>
+        <mxCell id="f5" parent="1" style="shape=document;whiteSpace=wrap;html=1;boundedLbl=1;fillColor=#fff2cc;strokeColor=#d6b656;" value="Feature DataFrame Output" vertex="1">
+          <mxGeometry height="70" width="200" x="60" y="480" as="geometry" />
+        </mxCell>
+        <mxCell id="t1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" value="Segment Signal&lt;br&gt;(Segment Length = 900)" vertex="1">
+          <mxGeometry height="60" width="200" x="400" y="180" as="geometry" />
+        </mxCell>
+        <mxCell id="t2" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" value="Train Linear Model (Linear/Ridge)&lt;br&gt;and Feature Standardization" vertex="1">
+          <mxGeometry height="60" width="200" x="400" y="280" as="geometry" />
+        </mxCell>
+        <mxCell id="t3" parent="1" style="rhombus;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" value="Threshold Filter&lt;br&gt;(Train R² &gt; 0.5 &amp;amp; PCC &gt; 0.5)" vertex="1">
+          <mxGeometry height="90" width="220" x="390" y="380" as="geometry" />
+        </mxCell>
+        <mxCell id="t4" parent="1" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#d5e8d4;strokeColor=#82b366;" value="Model Pool&lt;br&gt;(Store Weights, Means, X_raw)" vertex="1">
+          <mxGeometry height="80" width="200" x="400" y="520" as="geometry" />
+        </mxCell>
+        <mxCell id="i1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" value="Test Data Segmentation&lt;br&gt;(Len=900, Remainder Kept)" vertex="1">
+          <mxGeometry height="60" width="200" x="740" y="180" as="geometry" />
+        </mxCell>
+        <mxCell id="i2" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" value="Similarity (vs Model Pool)&lt;br&gt;Shape, Range(CCC), RGB" vertex="1">
+          <mxGeometry height="60" width="200" x="740" y="280" as="geometry" />
+        </mxCell>
+        <mxCell id="i3" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" value="Dynamic Top-K Model Selection&lt;br&gt;(Remainder reuses last Top-K)" vertex="1">
+          <mxGeometry height="60" width="200" x="740" y="380" as="geometry" />
+        </mxCell>
+        <mxCell id="i4" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" value="Ensemble Prediction&lt;br&gt;(Weighted Average)" vertex="1">
+          <mxGeometry height="60" width="200" x="740" y="480" as="geometry" />
+        </mxCell>
+        <mxCell id="i5" parent="1" style="shape=display;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;" value="Evaluation &amp; Output&lt;br&gt;(R², MAE, PCC &amp;amp; Plot)" vertex="1">
+          <mxGeometry height="60" width="200" x="740" y="580" as="geometry" />
+        </mxCell>
+        <mxCell id="e_f1_f2" edge="1" parent="1" source="f1" target="f2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_f2_f3" edge="1" parent="1" source="f2" target="f3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_f3_f4" edge="1" parent="1" source="f3" target="f4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_f4_f5" edge="1" parent="1" source="f4" target="f5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_f5_t1" edge="1" parent="1" source="f5" target="t1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="160" y="580" />
+              <mxPoint x="320" y="580" />
+              <mxPoint x="320" y="210" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_f5_i1" edge="1" parent="1" source="f5" target="i1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="160" y="600" />
+              <mxPoint x="680" y="600" />
+              <mxPoint x="680" y="210" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_t1_t2" edge="1" parent="1" source="t1" target="t2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_t2_t3" edge="1" parent="1" source="t2" target="t3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_t3_t4" edge="1" parent="1" source="t3" target="t4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_i1_i2" edge="1" parent="1" source="i1" target="i2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_i2_i3" edge="1" parent="1" source="i2" target="i3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_i3_i4" edge="1" parent="1" source="i3" target="i4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_i4_i5" edge="1" parent="1" source="i4" target="i5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_t4_i2" edge="1" parent="1" source="t4" target="i2">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="650" y="560" />
+              <mxPoint x="650" y="310" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_t4_i4" edge="1" parent="1" source="t4" target="i4">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="650" y="560" />
+              <mxPoint x="650" y="510" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edgeStyle" parent="0" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;" />
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

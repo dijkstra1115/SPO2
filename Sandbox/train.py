@@ -21,6 +21,7 @@ from common import (
     BW,
     all_channel_names,
     load_features_from_csv_paths,
+    filter_feat_df_by_spo2_range,
     train_model_pool,
 )
 
@@ -71,6 +72,12 @@ def main():
     if len(feat_df_all) == 0:
         raise SystemExit("沒有載入到任何樣本，請檢查 DATA_CSV_PATHS 與檔案是否存在。")
     print(f"總樣本數: {len(feat_df_all)}, 總 subject 數: {feat_df_all['subject_id'].nunique()}")
+    print("=" * 60)
+    print("依 SpO2 跨幅篩選 subject（僅保留跨幅 >= 10，且僅以長度足夠的 folder 計算跨幅）...")
+    feat_df_all = filter_feat_df_by_spo2_range(feat_df_all, segment_length=SEGMENT_LENGTH, verbose=True)
+    if len(feat_df_all) == 0:
+        raise SystemExit("篩選後沒有剩餘樣本，請檢查 MIN_SPO2_RANGE 或資料。")
+    print(f"篩選後樣本數: {len(feat_df_all)}, subject 數: {feat_df_all['subject_id'].nunique()}")
     print("=" * 60)
 
     print("\n" + "=" * 60)
