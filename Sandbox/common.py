@@ -22,13 +22,13 @@ STEP = 1
 OUTPUT_DIR = "./output"
 
 # Normalization
-USE_NORMALIZATION = False
+USE_NORMALIZATION = True
 # 正則化
-USE_REGULARIZATION = False
+USE_REGULARIZATION = True
 ALPHA = 1.0
 
 # Ensemble 模型池預設
-TOP_K = 5
+TOP_K = 25
 SEGMENT_LENGTH = 900
 
 # rPPG / HR 相關參數
@@ -38,8 +38,8 @@ MIN_RPPG_FRAMES = 512   # 穩定計算 HR 所需最少 rPPG frames
 BW = 0.2                # 帶通濾波帶寬 ±Hz
 
 # 模型池過濾閾值：訓練集 R² / PCC 低於此值的段不加入模型池
-MIN_TRAIN_R2 = 0.5
-MIN_TRAIN_PCC = 0.5
+MIN_TRAIN_R2 = 0.2
+MIN_TRAIN_PCC = 0.2
 
 # Subject 級 SpO2 跨幅篩選：僅保留「該 subject 所有 segment 串起來後」SpO2 最大最小值差值 >= 此值的 subject
 MIN_SPO2_RANGE = 10
@@ -49,10 +49,17 @@ MODEL_DIR = os.path.join(OUTPUT_DIR, "model")
 
 # 通道
 CHANNEL_ORDER = ["cg", "cr", "yiq_i", "dbdr_dr", "pos_y", "chrom_x"]
-all_channel_names = ["R", "G", "B"]
+all_channel_names = ["R", "G", "B", "RoR_RG", "RoR_RB"]
 
 # RGB 均值欄位（用於 model selection 時的 RGB 相似度）
 rgb_mean_col_names = ["R_mean", "G_mean", "B_mean"]
+# Additional derived features for global model only
+derived_acdc_col_names = ["POS_Y_acdc", "CHROM_X_acdc",
+                          "R_acdc_long", "G_acdc_long", "B_acdc_long",
+                          "RoR_RG_acdc_long", "RoR_RB_acdc_long",
+                          "delta_R_acdc", "delta_G_acdc", "delta_B_acdc",
+                          "acdc_ratio_long_short_R", "acdc_ratio_long_short_G", "acdc_ratio_long_short_B",
+                          "sqi"]
 # RGB 相似度在第二階段排序中的權重（與 range_score 加權組合）
 RGB_SIM_WEIGHT = 0.5
 
@@ -188,7 +195,10 @@ def build_features_from_df(df, source_name=None):
     for folder_name, g in df.groupby("Folder", sort=False):
         subject_id = g["Subject"].iloc[0]
         effective_id = f"{source_name}_{subject_id}" if source_name else subject_id
-        print(f"  Processing folder {folder_name} (Subject {effective_id})")
+        # Dataset group for cross-device leakage prevention (e.g., prc-c920 -> prc)
+        dataset_group = source_name.split('-')[0] if source_name else ""
+        subject_group = f"{dataset_group}_{subject_id}" if dataset_group else subject_id
+        print(f"  Processing folder {folder_name} (Subject {effective_id}, group {subject_group})")
         
         R = g["COLOR_R"].values.astype(float)
         G = g["COLOR_G"].values.astype(float)
@@ -220,6 +230,11 @@ def build_features_from_df(df, source_name=None):
         r_filtered = np.zeros(N)
         g_filtered = np.zeros(N)
         b_filtered = np.zeros(N)
+        # Derived channels
+        pos_y_raw = -2 * R + G + B
+        chrom_x_raw = 3 * R - 2 * G
+        pos_y_filtered = np.zeros(N)
+        chrom_x_filtered = np.zeros(N)
 
         epoch_edges = hr_update_frames + [N]
         for ei in range(len(epoch_edges) - 1):
@@ -233,6 +248,8 @@ def build_features_from_df(df, source_name=None):
                 r_filt = butter_filter(R, fs=FS, cutoff=[lo, hi], btype='band')
                 g_filt = butter_filter(G, fs=FS, cutoff=[lo, hi], btype='band')
                 b_filt = butter_filter(B, fs=FS, cutoff=[lo, hi], btype='band')
+                pos_y_filt = butter_filter(pos_y_raw, fs=FS, cutoff=[lo, hi], btype='band')
+                chrom_x_filt = butter_filter(chrom_x_raw, fs=FS, cutoff=[lo, hi], btype='band')
             except Exception as e:
                 continue
 
@@ -240,6 +257,8 @@ def build_features_from_df(df, source_name=None):
             r_filtered[fill_start:ep_end] = r_filt[fill_start:ep_end]
             g_filtered[fill_start:ep_end] = g_filt[fill_start:ep_end]
             b_filtered[fill_start:ep_end] = b_filt[fill_start:ep_end]
+            pos_y_filtered[fill_start:ep_end] = pos_y_filt[fill_start:ep_end]
+            chrom_x_filtered[fill_start:ep_end] = chrom_x_filt[fill_start:ep_end]
 
         first_start = max(0, MIN_RPPG_FRAMES - WIN_LEN + 1)
         for start in range(first_start, N - WIN_LEN + 1, STEP):
@@ -247,7 +266,7 @@ def build_features_from_df(df, source_name=None):
             y = float(SPO2[end - 1])
 
             # 【修改 2】：將 folder_name 也存入特徵中
-            row = {"subject_id": effective_id, "folder_name": folder_name, "SPO2_win_mean": y}
+            row = {"subject_id": effective_id, "subject_group": subject_group, "folder_name": folder_name, "SPO2_win_mean": y}
             for ch_name, filt_arr, orig_arr in [("R", r_filtered, R),
                                                   ("G", g_filtered, G),
                                                   ("B", b_filtered, B)]:
@@ -255,6 +274,59 @@ def build_features_from_df(df, source_name=None):
                 dc = np.mean(orig_arr[start:end])
                 row[f"{ch_name}_acdc"] = (ac / dc) if dc >= 1e-6 else 0.0
                 row[f"{ch_name}_mean"] = float(orig_arr[end - 1])
+            # Ratio of Ratios features (classic SpO2 estimation principle)
+            r_acdc = row["R_acdc"]
+            g_acdc = row["G_acdc"]
+            b_acdc = row["B_acdc"]
+            row["RoR_RG_acdc"] = (r_acdc / g_acdc) if abs(g_acdc) > 1e-8 else 0.0
+            row["RoR_RB_acdc"] = (r_acdc / b_acdc) if abs(b_acdc) > 1e-8 else 0.0
+            # Derived channel features: POS_Y and CHROM_X
+            for ch_name, filt_arr, orig_arr in [("POS_Y", pos_y_filtered, pos_y_raw),
+                                                  ("CHROM_X", chrom_x_filtered, chrom_x_raw)]:
+                ac = np.std(filt_arr[start:end])
+                dc = abs(np.mean(orig_arr[start:end]))
+                row[f"{ch_name}_acdc"] = (ac / dc) if dc >= 1e-6 else 0.0
+            # Long-window AC/DC features (180 frames = 6s, for GBR model stability)
+            long_win = 180
+            long_start = max(0, end - long_win)
+            for ch_name, filt_arr, orig_arr in [("R", r_filtered, R),
+                                                  ("G", g_filtered, G),
+                                                  ("B", b_filtered, B)]:
+                ac_long = np.std(filt_arr[long_start:end])
+                dc_long = np.mean(orig_arr[long_start:end])
+                row[f"{ch_name}_acdc_long"] = (ac_long / dc_long) if dc_long >= 1e-6 else 0.0
+            r_acdc_long = row["R_acdc_long"]
+            g_acdc_long = row["G_acdc_long"]
+            b_acdc_long = row["B_acdc_long"]
+            row["RoR_RG_acdc_long"] = (r_acdc_long / g_acdc_long) if abs(g_acdc_long) > 1e-8 else 0.0
+            row["RoR_RB_acdc_long"] = (r_acdc_long / b_acdc_long) if abs(b_acdc_long) > 1e-8 else 0.0
+            # Temporal derivative features: difference from previous window
+            if start > 0:
+                prev_start = start - STEP
+                prev_end = prev_start + WIN_LEN
+                for ch_name, filt_arr, orig_arr in [("R", r_filtered, R),
+                                                      ("G", g_filtered, G),
+                                                      ("B", b_filtered, B)]:
+                    prev_ac = np.std(filt_arr[prev_start:prev_end])
+                    prev_dc = np.mean(orig_arr[prev_start:prev_end])
+                    prev_acdc = (prev_ac / prev_dc) if prev_dc >= 1e-6 else 0.0
+                    row[f"delta_{ch_name}_acdc"] = row[f"{ch_name}_acdc"] - prev_acdc
+            else:
+                row["delta_R_acdc"] = 0.0
+                row["delta_G_acdc"] = 0.0
+                row["delta_B_acdc"] = 0.0
+            # SQI from rPPG signal in this window
+            rppg_win = raw_rppg[0, start:end]
+            if len(rppg_win) >= 30:
+                _, sqi_val, _, _ = calculate_hr_score(rppg_win, FS)
+                row["sqi"] = sqi_val
+            else:
+                row["sqi"] = 0.0
+            # Multi-scale contrast: ratio of long-window to short-window AC/DC
+            for ch_name in ["R", "G", "B"]:
+                short_val = row[f"{ch_name}_acdc"]
+                long_val = row[f"{ch_name}_acdc_long"]
+                row[f"acdc_ratio_long_short_{ch_name}"] = (long_val / short_val) if abs(short_val) > 1e-8 else 1.0
             rows.append(row)
             
     return rows
@@ -502,8 +574,10 @@ def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH,
 
                 # 修改 model_id，加入 folder_name 確保唯一性與可讀性
                 model_id = f"{subject_id}_{folder_name}_seg{seg_idx}"
+                subject_group = subdf["subject_group"].iloc[0] if "subject_group" in subdf.columns else subject_id
                 model_pool.append({
                     'subject_id': subject_id,
+                    'subject_group': subject_group,
                     'folder_name': folder_name,
                     'segment_id': seg_idx,
                     'model_id': model_id,
@@ -515,6 +589,8 @@ def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH,
                     'stds': stds.values if stds is not None else None,
                     'X_raw_segment': X_raw_segment.values,
                     'rgb_mean_segment': rgb_mean_segment,
+                    'spo2_mean': float(np.mean(y_segment)),
+                    'spo2_std': float(np.std(y_segment)),
                 })
                 total_segments += 1
         print(f"  Subject {subject_id} 完成")
@@ -524,6 +600,9 @@ def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH,
     print(f"  過濾統計: R²不足({filtered_by_r2}), PCC不足({filtered_by_pcc})")
     print("=" * 60)
     return model_pool
+
+
+GLOBAL_MODEL_BLEND = 0.35  # Blend weight for global LOSO model (0 = ensemble only, 1 = global only)
 
 
 def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
@@ -547,7 +626,7 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
         used_channels = [ch for ch in selected_channels if ch in all_channel_names]
         
     feature_cols = [f"{ch}_acdc" for ch in used_channels]
-    req_cols = ["subject_id", "folder_name", "SPO2_win_mean"] + feature_cols + rgb_mean_col_names
+    req_cols = ["subject_id", "subject_group", "folder_name", "SPO2_win_mean"] + feature_cols + rgb_mean_col_names + derived_acdc_col_names
     feat_df_selected = feat_df[req_cols].copy()
 
     results = []
@@ -555,8 +634,27 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
     all_subjects_labels = []
 
     for test_subject_id, test_subdf in feat_df_selected.groupby("subject_id", sort=False):
-        print(f"\n測試 Subject {test_subject_id}")
-        
+        test_subject_group = test_subdf["subject_group"].iloc[0]
+        print(f"\n測試 Subject {test_subject_id} (group {test_subject_group})")
+
+        # Train a global LOSO model for blending
+        # Exclude all subjects in the same group (same person, different devices)
+        global_model = None
+        if GLOBAL_MODEL_BLEND > 0:
+            from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
+            train_df = feat_df_selected[feat_df_selected["subject_group"] != test_subject_group]
+            # Use feature cols, RGB means, and derived channel features for global model
+            global_feature_cols = feature_cols + [c for c in rgb_mean_col_names if c not in feature_cols] + derived_acdc_col_names
+            X_global_train = train_df[global_feature_cols].values.astype(float)
+            y_global_train = train_df["SPO2_win_mean"].values.astype(float)
+            if len(X_global_train) > 10:
+                global_model = HistGradientBoostingRegressor(
+                    max_iter=300, max_depth=3, learning_rate=0.03,
+                    min_samples_leaf=100, l2_regularization=2.0,
+                    random_state=42
+                )
+                global_model.fit(X_global_train, y_global_train)
+
         subject_segment_predictions = []
         subject_segment_labels = []
 
@@ -595,12 +693,14 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                     
                     similarities = []
                     for model_info in model_pool:
-                        if model_info['subject_id'] == test_subject_id:
+                        # Exclude all models from same person (same group), not just same device
+                        model_group = model_info.get('subject_group', model_info['subject_id'])
+                        if model_group == test_subject_group:
                             continue
-                            
+
                         shape_score, range_score = calculate_similarity(model_info['X_raw_segment'], X_test_segment_array, model_info['weights'])
                         rgb_score = calculate_rgb_similarity(model_info['rgb_mean_segment'], rgb_mean_test_segment)
-                        
+
                         similarities.append({
                             'model_info': model_info,
                             'shape_score': shape_score,
@@ -608,15 +708,15 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                             'rgb_score': rgb_score,
                             'model_id': model_info['model_id']
                         })
-                        
+
                     if len(similarities) == 0:
                         continue
 
-                    # 排序篩選 TOP_K
-                    similarities.sort(key=lambda x: x['shape_score'], reverse=True)
-                    top_m_candidates = similarities[:min(2 * top_k, len(similarities))]
-                    top_m_candidates.sort(key=lambda x: x['range_score'] + RGB_SIM_WEIGHT * x['rgb_score'], reverse=True)
-                    top_k_models = top_m_candidates[:min(top_k, len(top_m_candidates))]
+                    # Single-stage selection: combine all similarity metrics
+                    for s in similarities:
+                        s['combined'] = 0.3 * s['shape_score'] + 0.7 * s['range_score']
+                    similarities.sort(key=lambda x: x['combined'], reverse=True)
+                    top_k_models = similarities[:min(top_k, len(similarities))]
                     
                     last_top_k_models = top_k_models 
                     
@@ -634,13 +734,46 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                     X_test_input = X_test_segment_df
 
                 segment_preds = []
+                sim_weights = []
+                train_spo2_stats = []  # (mean, std) per model
                 for sim_info in top_k_models:
                     m = sim_info['model_info']
                     y_p = np.dot(X_test_input[m['feature_cols']].values, m['weights']) + m['bias']
+                    if np.any(np.isnan(y_p)) or np.any(np.isinf(y_p)):
+                        continue
                     segment_preds.append(y_p)
-                    
+                    w = max(sim_info['combined'], 0.01)
+                    sim_weights.append(w)
+                    train_spo2_stats.append((m.get('spo2_mean', 95.0), m.get('spo2_std', 3.0)))
+
                 if len(segment_preds) > 0:
-                    subject_segment_predictions.append(np.mean(segment_preds, axis=0))
+                    preds_arr = np.array(segment_preds)
+                    weights_arr = np.array(sim_weights)
+                    train_means_arr = np.array([s[0] for s in train_spo2_stats])
+                    train_stds_arr = np.array([s[1] for s in train_spo2_stats])
+                    # Consensus filtering
+                    med_pred = np.median(preds_arr, axis=0)
+                    deviations = np.mean(np.abs(preds_arr - med_pred), axis=1)
+                    dev_threshold = np.median(deviations) * 1.5
+                    keep_mask = deviations <= dev_threshold
+                    if np.sum(keep_mask) >= 3:
+                        preds_arr = preds_arr[keep_mask]
+                        weights_arr = weights_arr[keep_mask]
+                        train_means_arr = train_means_arr[keep_mask]
+                        train_stds_arr = train_stds_arr[keep_mask]
+                    # Weighted average
+                    weights_arr = weights_arr / weights_arr.sum()
+                    avg_pred = np.average(preds_arr, axis=0, weights=weights_arr)
+                    # Blend with global LOSO model
+                    if global_model is not None and GLOBAL_MODEL_BLEND > 0:
+                        global_feature_cols = feature_cols + [c for c in rgb_mean_col_names if c not in feature_cols] + derived_acdc_col_names
+                        rgb_mean_test_seg = folder_df[rgb_mean_col_names].iloc[start_idx:end_idx].astype(float)
+                        derived_test_seg = folder_df[derived_acdc_col_names].iloc[start_idx:end_idx].astype(float)
+                        X_global_test = pd.concat([X_test_segment_df[feature_cols], rgb_mean_test_seg, derived_test_seg], axis=1)
+                        global_pred = global_model.predict(X_global_test.values)
+                        avg_pred = (1 - GLOBAL_MODEL_BLEND) * avg_pred + GLOBAL_MODEL_BLEND * global_pred
+                    avg_pred = np.clip(avg_pred, 70, 100)
+                    subject_segment_predictions.append(avg_pred)
                     subject_segment_labels.append(y_test_segment)
 
         # 彙整該 Subject 結果
@@ -649,6 +782,18 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
 
         y_ensemble = np.concatenate(subject_segment_predictions)
         y_test = np.concatenate(subject_segment_labels)
+
+        # Rolling median smoothing to reduce prediction noise
+        smooth_window = 1801  # ~60 seconds at 30fps, must be odd
+        if len(y_ensemble) >= smooth_window:
+            y_smoothed = pd.Series(y_ensemble).rolling(window=smooth_window, center=True, min_periods=1).median().values
+            y_ensemble = y_smoothed
+
+        # Second-pass EMA smoothing for additional noise reduction
+        ema_span = 901  # ~30 seconds at 30fps
+        if len(y_ensemble) >= ema_span:
+            y_ema = pd.Series(y_ensemble).ewm(span=ema_span, adjust=False).mean().values
+            y_ensemble = y_ema
 
         # 防護：實際用於評估的資料跨幅若仍不足，跳過該 subject（不列入結果、不繪圖）
         subject_range = float(np.max(y_test) - np.min(y_test))
