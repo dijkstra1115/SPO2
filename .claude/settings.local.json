@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python train.py)",
+      "Bash(python -u train.py)",
+      "Bash(python -c \":*)",
+      "Bash(python -c \"print\\(''hello''\\)\")",
+      "Bash(py --version)",
+      "Bash(/c/Users/yutin/anaconda3/python.exe -c \"print\\(''hello''\\)\")",
+      "Bash(/c/Users/yutin/anaconda3/python.exe -u train.py)",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/yutin/anaconda3/python.exe -u train.py)",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/yutin/anaconda3/python.exe -u infer.py)",
+      "Bash(/c/Users/yutin/anaconda3/python.exe -c \"import xgboost; print\\(xgboost.__version__\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/yutin/anaconda3/python.exe train.py)",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/yutin/anaconda3/python.exe infer.py)",
+      "Bash(/c/Users/yutin/anaconda3/python.exe -c \":*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Read(//c/Users/yutin/code/RGB-SpO2/Data//**)",
+      "Read(//c/Users/yutin/code/RGB-SpO2/Sandbox/Data//**)",
+      "Read(//c/Users/yutin/code/RGB-SpO2/**)",
+      "Bash(/c/Users/yutin/anaconda3/python.exe test_overfitting.py)",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/yutin/anaconda3/python.exe test_overfitting.py)",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/yutin/anaconda3/python.exe -c \":*)",
+      "Bash(ls /c/Users/yutin/code/RGB-SpO2/Sandbox/.claude/worktrees/gallant-banzai/Sandbox/data/*.csv)",
+      "Bash(xargs -I{} basename {} .csv)"
+    ]
+  }
+}
