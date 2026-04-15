@@ -5,3 +5,7 @@
 /Sandbox/subject_plots/
 /Sandbox/output/model/
 /Sandbox/output/sub_plot/
+/Sandbox/data_new/
+/Sandbox/output/*.csv
+/Sandbox/output/*.txt
+/Sandbox/output/*.log
