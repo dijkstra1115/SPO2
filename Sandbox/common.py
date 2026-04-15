@@ -37,7 +37,7 @@ HR_UPDATE_SEC = 15       # HR 重新計算間隔（秒）
 MIN_RPPG_FRAMES = 512   # 穩定計算 HR 所需最少 rPPG frames
 BW = 0.2                # 帶通濾波帶寬 ±Hz
 
-# 模型池過濾閾值：訓練集 R² / PCC 低於此值的段不加入模型池
+# 模型池過濾閾值：訓練集 R2 / PCC 低於此值的段不加入模型池
 MIN_TRAIN_R2 = 0.2
 MIN_TRAIN_PCC = 0.2
 
@@ -53,6 +53,19 @@ all_channel_names = ["R", "G", "B", "RoR_RG", "RoR_RB"]
 
 # RGB 均值欄位（用於 model selection 時的 RGB 相似度）
 rgb_mean_col_names = ["R_mean", "G_mean", "B_mean"]
+pool_base_feature_cols = [
+    "R_acdc", "G_acdc", "B_acdc",
+    "RoR_RG_acdc", "RoR_RB_acdc",
+]
+pool_extended_feature_cols = pool_base_feature_cols + [
+    "POS_Y_acdc", "CHROM_X_acdc",
+    "R_acdc_long", "G_acdc_long", "B_acdc_long",
+    "RoR_RG_acdc_long", "RoR_RB_acdc_long",
+    "delta_R_acdc", "delta_G_acdc", "delta_B_acdc",
+    "acdc_ratio_long_short_R", "acdc_ratio_long_short_G", "acdc_ratio_long_short_B",
+    "sqi",
+]
+USE_EXTENDED_POOL_FEATURES = True
 # Additional derived features for global model only
 derived_acdc_col_names = ["POS_Y_acdc", "CHROM_X_acdc",
                           "R_acdc_long", "G_acdc_long", "B_acdc_long",
@@ -62,6 +75,33 @@ derived_acdc_col_names = ["POS_Y_acdc", "CHROM_X_acdc",
                           "sqi"]
 # RGB 相似度在第二階段排序中的權重（與 range_score 加權組合）
 RGB_SIM_WEIGHT = 0.5
+
+
+def get_pool_feature_cols(selected_channels=None):
+    if USE_EXTENDED_POOL_FEATURES and selected_channels is None:
+        return list(pool_extended_feature_cols)
+
+    if selected_channels is None:
+        used_channels = all_channel_names
+    else:
+        used_channels = [ch for ch in selected_channels if ch in all_channel_names]
+    return [f"{ch}_acdc" for ch in used_channels]
+
+
+def dedupe_preserve_order(columns):
+    return list(dict.fromkeys(columns))
+
+
+def resolve_column_name(df, candidates):
+    for name in candidates:
+        if name in df.columns:
+            return name
+    lowered = {str(col).strip().lower(): col for col in df.columns}
+    for name in candidates:
+        match = lowered.get(str(name).strip().lower())
+        if match is not None:
+            return match
+    raise KeyError(f"Missing required column. Tried: {candidates}")
 
 
 def extract_subject_id(folder):
@@ -189,6 +229,7 @@ def butter_filter(sig, fs=30, cutoff=0.1, btype='low', order=3):
 def build_features_from_df(df, source_name=None):
     df = df.copy()
     df["Subject"] = df["Folder"].apply(extract_subject_id)
+    spo2_col = resolve_column_name(df, ["SPO2", "SPo2", "SpO2", "spo2", "SpO2 Score", "SPO2 Score"])
     rows = []
     
     # 【修改 1】：改為依照 Folder 分組處理，避免訊號濾波跨越片段
@@ -203,7 +244,7 @@ def build_features_from_df(df, source_name=None):
         R = g["COLOR_R"].values.astype(float)
         G = g["COLOR_G"].values.astype(float)
         B = g["COLOR_B"].values.astype(float)
-        SPO2 = g["SPO2"].values.astype(float)
+        SPO2 = g[spo2_col].values.astype(float)
         N = len(g)
 
         if N < MIN_RPPG_FRAMES + WIN_LEN:
@@ -266,7 +307,13 @@ def build_features_from_df(df, source_name=None):
             y = float(SPO2[end - 1])
 
             # 【修改 2】：將 folder_name 也存入特徵中
-            row = {"subject_id": effective_id, "subject_group": subject_group, "folder_name": folder_name, "SPO2_win_mean": y}
+            row = {
+                "subject_id": effective_id,
+                "subject_group": subject_group,
+                "dataset_name": source_name or "unknown",
+                "folder_name": folder_name,
+                "SPO2_win_mean": y,
+            }
             for ch_name, filt_arr, orig_arr in [("R", r_filtered, R),
                                                   ("G", g_filtered, G),
                                                   ("B", b_filtered, B)]:
@@ -470,6 +517,245 @@ def calculate_rgb_similarity(rgb_mean_a, rgb_mean_b):
     return float(np.clip(cos_sim, 0.0, 1.0))
 
 
+def infer_dataset_name(subject_id, default="unknown"):
+    if not subject_id or "_" not in str(subject_id):
+        return default
+    return str(subject_id).rsplit("_", 1)[0]
+
+
+def evaluate_single_model_on_dataset(model_info, dataset_df, feature_cols, segment_length,
+                                     use_normalization=USE_NORMALIZATION):
+    predictions = []
+    labels = []
+    subject_rows = []
+
+    for test_subject_id, test_subdf in dataset_df.groupby("subject_id", sort=False):
+        test_subject_group = test_subdf["subject_group"].iloc[0]
+        test_exclusion_key = test_subject_group if EXCLUDE_SAME_SUBJECT_GROUP else test_subject_id
+        model_exclusion_key = (
+            model_info.get("subject_group", model_info["subject_id"])
+            if EXCLUDE_SAME_SUBJECT_GROUP else
+            model_info["subject_id"]
+        )
+        if test_exclusion_key == model_exclusion_key:
+            continue
+
+        subject_segment_predictions = []
+        subject_segment_labels = []
+
+        for _, folder_df in test_subdf.groupby("folder_name", sort=False):
+            n_samples = len(folder_df)
+            if n_samples < segment_length:
+                continue
+
+            n_segments = n_samples // segment_length
+            X_test_full = folder_df[feature_cols].astype(float)
+            y_test_full = folder_df["SPO2_win_mean"].values.astype(float)
+
+            for seg_idx in range(n_segments):
+                start_idx = seg_idx * segment_length
+                end_idx = start_idx + segment_length
+                X_test_segment_df = X_test_full.iloc[start_idx:end_idx].copy()
+                y_test_segment = y_test_full[start_idx:end_idx]
+
+                test_stds = X_test_segment_df.std(axis=0)
+                if (test_stds < 1e-8).any():
+                    continue
+
+                if use_normalization:
+                    test_means = X_test_segment_df.mean(axis=0)
+                    X_test_input = (X_test_segment_df - test_means) / test_stds
+                else:
+                    X_test_input = X_test_segment_df
+
+                y_pred = np.dot(X_test_input[model_info["feature_cols"]].values, model_info["weights"]) + model_info["bias"]
+                if np.any(np.isnan(y_pred)) or np.any(np.isinf(y_pred)):
+                    continue
+
+                subject_segment_predictions.append(y_pred)
+                subject_segment_labels.append(y_test_segment)
+
+        if len(subject_segment_predictions) == 0:
+            continue
+
+        y_pred_full = np.concatenate(subject_segment_predictions)
+        y_true_full = np.concatenate(subject_segment_labels)
+        subject_range = float(np.max(y_true_full) - np.min(y_true_full))
+        if subject_range < MIN_SPO2_RANGE:
+            continue
+
+        r2 = r2_score(y_true_full, y_pred_full)
+        mae = mean_absolute_error(y_true_full, y_pred_full)
+        pcc = np.nan if np.std(y_pred_full) < 1e-8 else pearsonr(y_true_full, y_pred_full)[0]
+        subject_rows.append({
+            "subject_id": test_subject_id,
+            "R2": r2,
+            "MAE": mae,
+            "PCC": pcc,
+            "n_frames": len(y_true_full),
+        })
+        predictions.append(y_pred_full)
+        labels.append(y_true_full)
+
+    if len(subject_rows) == 0:
+        return {
+            "n_subjects": 0,
+            "mean_R2": np.nan,
+            "mean_MAE": np.nan,
+            "mean_PCC": np.nan,
+            "overall_PCC": np.nan,
+        }
+
+    subject_df = pd.DataFrame(subject_rows)
+    all_pred = np.concatenate(predictions)
+    all_true = np.concatenate(labels)
+    overall_pcc = np.nan if np.std(all_pred) < 1e-8 else pearsonr(all_true, all_pred)[0]
+    return {
+        "n_subjects": int(len(subject_df)),
+        "mean_R2": float(subject_df["R2"].mean()),
+        "mean_MAE": float(subject_df["MAE"].mean()),
+        "mean_PCC": float(subject_df["PCC"].mean()),
+        "overall_PCC": float(overall_pcc) if not np.isnan(overall_pcc) else np.nan,
+    }
+
+
+def evaluate_model_pool_by_dataset(model_pool, feat_df, selected_channels=None,
+                                   segment_length=SEGMENT_LENGTH,
+                                   use_normalization=USE_NORMALIZATION):
+    feature_cols = get_pool_feature_cols(selected_channels)
+    req_cols = ["subject_id", "subject_group", "dataset_name", "folder_name", "SPO2_win_mean"] + feature_cols
+    feat_df_selected = feat_df[req_cols].copy()
+
+    dataset_names = []
+    if "dataset_name" in feat_df_selected.columns:
+        dataset_names = sorted(feat_df_selected["dataset_name"].dropna().unique().tolist())
+    if not dataset_names:
+        dataset_names = sorted({infer_dataset_name(sid) for sid in feat_df_selected["subject_id"].unique()})
+        feat_df_selected["dataset_name"] = feat_df_selected["subject_id"].map(infer_dataset_name)
+
+    evaluation_rows = []
+    for model_info in model_pool:
+        for dataset_name in dataset_names:
+            dataset_df = feat_df_selected[feat_df_selected["dataset_name"] == dataset_name]
+            metrics = evaluate_single_model_on_dataset(
+                model_info=model_info,
+                dataset_df=dataset_df,
+                feature_cols=feature_cols,
+                segment_length=segment_length,
+                use_normalization=use_normalization,
+            )
+            evaluation_rows.append({
+                "model_id": model_info["model_id"],
+                "dataset_name": dataset_name,
+                "train_subject_id": model_info["subject_id"],
+                "train_dataset_name": model_info.get("dataset_name", infer_dataset_name(model_info["subject_id"])),
+                "segment_id": model_info["segment_id"],
+                "train_R2": model_info.get("train_r2", np.nan),
+                "train_PCC": model_info.get("train_pcc", np.nan),
+                **metrics,
+            })
+
+    return pd.DataFrame(evaluation_rows)
+
+
+def select_model_pool(raw_model_pool, feat_df, selected_channels=None,
+                      segment_length=SEGMENT_LENGTH,
+                      use_normalization=USE_NORMALIZATION,
+                      min_dataset_r2=0.1,
+                      min_pool_size=5,
+                      max_pool_size=None):
+    if len(raw_model_pool) == 0:
+        empty_df = pd.DataFrame()
+        return raw_model_pool, empty_df, empty_df
+
+    eval_df = evaluate_model_pool_by_dataset(
+        model_pool=raw_model_pool,
+        feat_df=feat_df,
+        selected_channels=selected_channels,
+        segment_length=segment_length,
+        use_normalization=use_normalization,
+    )
+    if len(eval_df) == 0:
+        empty_df = pd.DataFrame()
+        return raw_model_pool, empty_df, empty_df
+
+    valid_eval_df = eval_df[eval_df["n_subjects"] > 0].copy()
+    if len(valid_eval_df) == 0:
+        summary_df = eval_df.copy()
+        summary_df["coverage_count"] = 0
+        summary_df["model_score"] = np.nan
+        return raw_model_pool, eval_df, summary_df
+
+    summary_df = (
+        valid_eval_df.groupby("model_id", as_index=False)
+        .agg(
+            coverage_count=("mean_R2", lambda s: int(np.sum(np.nan_to_num(s, nan=-1.0) >= min_dataset_r2))),
+            mean_dataset_R2=("mean_R2", "mean"),
+            best_dataset_R2=("mean_R2", "max"),
+            mean_dataset_PCC=("mean_PCC", "mean"),
+            mean_dataset_MAE=("mean_MAE", "mean"),
+            datasets_evaluated=("dataset_name", "nunique"),
+            train_subject_id=("train_subject_id", "first"),
+            train_dataset_name=("train_dataset_name", "first"),
+            segment_id=("segment_id", "first"),
+            train_R2=("train_R2", "first"),
+            train_PCC=("train_PCC", "first"),
+        )
+    )
+    summary_df["model_score"] = (
+        0.7 * summary_df["mean_dataset_R2"].fillna(-1.0)
+        + 0.2 * summary_df["best_dataset_R2"].fillna(-1.0)
+        + 0.1 * summary_df["mean_dataset_PCC"].fillna(-1.0)
+    )
+    summary_df = summary_df.sort_values(
+        ["coverage_count", "model_score", "best_dataset_R2", "train_PCC"],
+        ascending=[False, False, False, False],
+    ).reset_index(drop=True)
+
+    max_pool_size = max_pool_size or len(summary_df)
+    max_pool_size = max(min_pool_size, min(max_pool_size, len(summary_df)))
+
+    selected_ids = []
+    selected_id_set = set()
+
+    dataset_seed_df = valid_eval_df.sort_values(
+        ["dataset_name", "mean_R2", "mean_PCC", "train_PCC"],
+        ascending=[True, False, False, False],
+    )
+    for dataset_name, dataset_rows in dataset_seed_df.groupby("dataset_name", sort=False):
+        preferred = dataset_rows[dataset_rows["mean_R2"] >= min_dataset_r2]
+        candidate_rows = preferred if len(preferred) > 0 else dataset_rows
+        best_model_id = candidate_rows.iloc[0]["model_id"]
+        if best_model_id not in selected_id_set:
+            selected_ids.append(best_model_id)
+            selected_id_set.add(best_model_id)
+        if len(selected_ids) >= max_pool_size:
+            break
+
+    for _, row in summary_df.iterrows():
+        model_id = row["model_id"]
+        if model_id in selected_id_set:
+            continue
+        selected_ids.append(model_id)
+        selected_id_set.add(model_id)
+        if len(selected_ids) >= max_pool_size:
+            break
+
+    if len(selected_ids) < min_pool_size:
+        for _, row in summary_df.iterrows():
+            model_id = row["model_id"]
+            if model_id in selected_id_set:
+                continue
+            selected_ids.append(model_id)
+            selected_id_set.add(model_id)
+            if len(selected_ids) >= min_pool_size:
+                break
+
+    selected_pool = [model_info for model_info in raw_model_pool if model_info["model_id"] in selected_id_set]
+    summary_df["selected"] = summary_df["model_id"].isin(selected_id_set)
+    return selected_pool, eval_df, summary_df
+
+
 def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH,
                      use_normalization=USE_NORMALIZATION, use_regularization=USE_REGULARIZATION, alpha=ALPHA,
                      min_train_r2=MIN_TRAIN_R2, min_train_pcc=MIN_TRAIN_PCC):
@@ -481,15 +767,10 @@ def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH,
     print(f"訓練模型池（段長度={segment_length}，依 Folder 獨立切割）...")
     print("=" * 60)
     
-    if selected_channels is None:
-        used_channels = all_channel_names
-    else:
-        used_channels = [ch for ch in selected_channels if ch in all_channel_names]
-        
-    feature_cols = [f"{ch}_acdc" for ch in used_channels]
+    feature_cols = get_pool_feature_cols(selected_channels)
     
     # 確保特徵中包含 folder_name
-    req_cols = ["subject_id", "folder_name", "SPO2_win_mean"] + feature_cols + rgb_mean_col_names
+    req_cols = ["subject_id", "subject_group", "dataset_name", "folder_name", "SPO2_win_mean"] + feature_cols + rgb_mean_col_names
     if "folder_name" not in feat_df.columns:
         raise ValueError("特徵 DataFrame 缺少 'folder_name' 欄位，請確認 build_features_from_df 是否已更新！")
         
@@ -564,7 +845,7 @@ def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH,
                     train_pcc = train_pcc if not np.isnan(train_pcc) else -1.0
 
                 if train_r2 <= min_train_r2:
-                    print(f"    段 {seg_idx}: 跳過（訓練集 R² = {train_r2:.4f} <= {min_train_r2}）")
+                    print(f"    段 {seg_idx}: 跳過（訓練集 R2 = {train_r2:.4f} <= {min_train_r2}）")
                     filtered_by_r2 += 1
                     continue
                 if train_pcc <= min_train_pcc:
@@ -581,10 +862,13 @@ def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH,
                     'folder_name': folder_name,
                     'segment_id': seg_idx,
                     'model_id': model_id,
+                    'dataset_name': folder_df["dataset_name"].iloc[0] if "dataset_name" in folder_df.columns else infer_dataset_name(subject_id),
                     'model': lr,
                     'feature_cols': X_raw_segment.columns.tolist(),
                     'weights': lr.coef_,
                     'bias': lr.intercept_,
+                    'train_r2': float(train_r2),
+                    'train_pcc': float(train_pcc),
                     'means': means.values if means is not None else None,
                     'stds': stds.values if stds is not None else None,
                     'X_raw_segment': X_raw_segment.values,
@@ -597,18 +881,22 @@ def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH,
 
     print(f"\n模型池建構完成:")
     print(f"  最終模型池大小: {len(model_pool)} 個模型")
-    print(f"  過濾統計: R²不足({filtered_by_r2}), PCC不足({filtered_by_pcc})")
+    print(f"  過濾統計: R2不足({filtered_by_r2}), PCC不足({filtered_by_pcc})")
     print("=" * 60)
     return model_pool
 
 
 GLOBAL_MODEL_BLEND = 0.35  # Blend weight for global LOSO model (0 = ensemble only, 1 = global only)
+ROLLING_MEDIAN_WINDOW = 1801  # Set <= 1 to disable subject-level rolling median smoothing
+EMA_SPAN = 901  # Set <= 1 to disable subject-level EMA smoothing
+EXCLUDE_SAME_SUBJECT_GROUP = True  # When False, only exact same subject_id is excluded from the pool/global model
 
 
 def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                                   segment_length=SEGMENT_LENGTH,
                                   use_normalization=USE_NORMALIZATION,
-                                  save_plots=False, output_dir=OUTPUT_DIR):
+                                  save_plots=False, output_dir=OUTPUT_DIR,
+                                  return_frame_predictions=False):
     """
     使用 ensemble 模型池進行預測與評估。
     邏輯更新：
@@ -620,31 +908,35 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
     print(f"使用 Ensemble 模型池進行預測 (TOP_K={top_k}, 段長度={segment_length})...")
     print("=" * 60)
     
-    if selected_channels is None:
-        used_channels = all_channel_names
-    else:
-        used_channels = [ch for ch in selected_channels if ch in all_channel_names]
-        
-    feature_cols = [f"{ch}_acdc" for ch in used_channels]
-    req_cols = ["subject_id", "subject_group", "folder_name", "SPO2_win_mean"] + feature_cols + rgb_mean_col_names + derived_acdc_col_names
+    feature_cols = get_pool_feature_cols(selected_channels)
+    req_cols = dedupe_preserve_order(
+        ["subject_id", "subject_group", "folder_name", "SPO2_win_mean"] +
+        feature_cols + rgb_mean_col_names + derived_acdc_col_names
+    )
     feat_df_selected = feat_df[req_cols].copy()
 
     results = []
     all_subjects_predictions = []
     all_subjects_labels = []
+    frame_prediction_rows = []
 
     for test_subject_id, test_subdf in feat_df_selected.groupby("subject_id", sort=False):
         test_subject_group = test_subdf["subject_group"].iloc[0]
         print(f"\n測試 Subject {test_subject_id} (group {test_subject_group})")
+        test_exclusion_key = test_subject_group if EXCLUDE_SAME_SUBJECT_GROUP else test_subject_id
 
         # Train a global LOSO model for blending
         # Exclude all subjects in the same group (same person, different devices)
         global_model = None
+        global_feature_cols = None
         if GLOBAL_MODEL_BLEND > 0:
             from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
-            train_df = feat_df_selected[feat_df_selected["subject_group"] != test_subject_group]
+            train_exclusion_col = "subject_group" if EXCLUDE_SAME_SUBJECT_GROUP else "subject_id"
+            train_df = feat_df_selected[feat_df_selected[train_exclusion_col] != test_exclusion_key]
             # Use feature cols, RGB means, and derived channel features for global model
-            global_feature_cols = feature_cols + [c for c in rgb_mean_col_names if c not in feature_cols] + derived_acdc_col_names
+            global_feature_cols = dedupe_preserve_order(
+                feature_cols + [c for c in rgb_mean_col_names if c not in feature_cols] + derived_acdc_col_names
+            )
             X_global_train = train_df[global_feature_cols].values.astype(float)
             y_global_train = train_df["SPO2_win_mean"].values.astype(float)
             if len(X_global_train) > 10:
@@ -694,8 +986,12 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                     similarities = []
                     for model_info in model_pool:
                         # Exclude all models from same person (same group), not just same device
-                        model_group = model_info.get('subject_group', model_info['subject_id'])
-                        if model_group == test_subject_group:
+                        model_exclusion_key = (
+                            model_info.get('subject_group', model_info['subject_id'])
+                            if EXCLUDE_SAME_SUBJECT_GROUP else
+                            model_info['subject_id']
+                        )
+                        if model_exclusion_key == test_exclusion_key:
                             continue
 
                         shape_score, range_score = calculate_similarity(model_info['X_raw_segment'], X_test_segment_array, model_info['weights'])
@@ -766,10 +1062,7 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                     avg_pred = np.average(preds_arr, axis=0, weights=weights_arr)
                     # Blend with global LOSO model
                     if global_model is not None and GLOBAL_MODEL_BLEND > 0:
-                        global_feature_cols = feature_cols + [c for c in rgb_mean_col_names if c not in feature_cols] + derived_acdc_col_names
-                        rgb_mean_test_seg = folder_df[rgb_mean_col_names].iloc[start_idx:end_idx].astype(float)
-                        derived_test_seg = folder_df[derived_acdc_col_names].iloc[start_idx:end_idx].astype(float)
-                        X_global_test = pd.concat([X_test_segment_df[feature_cols], rgb_mean_test_seg, derived_test_seg], axis=1)
+                        X_global_test = folder_df[global_feature_cols].iloc[start_idx:end_idx].astype(float)
                         global_pred = global_model.predict(X_global_test.values)
                         avg_pred = (1 - GLOBAL_MODEL_BLEND) * avg_pred + GLOBAL_MODEL_BLEND * global_pred
                     avg_pred = np.clip(avg_pred, 70, 100)
@@ -784,14 +1077,16 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
         y_test = np.concatenate(subject_segment_labels)
 
         # Rolling median smoothing to reduce prediction noise
-        smooth_window = 1801  # ~60 seconds at 30fps, must be odd
-        if len(y_ensemble) >= smooth_window:
+        smooth_window = int(ROLLING_MEDIAN_WINDOW)
+        if smooth_window > 1 and smooth_window % 2 == 0:
+            smooth_window += 1
+        if smooth_window > 1 and len(y_ensemble) >= smooth_window:
             y_smoothed = pd.Series(y_ensemble).rolling(window=smooth_window, center=True, min_periods=1).median().values
             y_ensemble = y_smoothed
 
         # Second-pass EMA smoothing for additional noise reduction
-        ema_span = 901  # ~30 seconds at 30fps
-        if len(y_ensemble) >= ema_span:
+        ema_span = int(EMA_SPAN)
+        if ema_span > 1 and len(y_ensemble) >= ema_span:
             y_ema = pd.Series(y_ensemble).ewm(span=ema_span, adjust=False).mean().values
             y_ensemble = y_ema
 
@@ -808,6 +1103,17 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
         results.append({"subject_id": test_subject_id, "n_frames": len(y_test), "R2": r2, "MAE": mae, "PCC": pcc})
         all_subjects_predictions.append(y_ensemble)
         all_subjects_labels.append(y_test)
+        if return_frame_predictions:
+            frame_prediction_rows.extend(
+                {
+                    "subject_id": test_subject_id,
+                    "subject_group": test_subject_group,
+                    "frame_idx": frame_idx,
+                    "y_true": float(y_true_val),
+                    "y_pred": float(y_pred_val),
+                }
+                for frame_idx, (y_true_val, y_pred_val) in enumerate(zip(y_test, y_ensemble))
+            )
 
         if save_plots:
             plot_dir = os.path.join(output_dir, "sub_plot")
@@ -822,7 +1128,7 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                 current_pos += len(seg_pred)
                 plt.axvline(x=current_pos, color='blue', linestyle=':', alpha=0.3)
                 
-            plt.title(f"Subject {test_subject_id} - Ensemble (TOP_K={top_k}, R²={r2:.3f}, MAE={mae:.2f}, PCC={pcc if not np.isnan(pcc) else 0:.3f})")
+            plt.title(f"Subject {test_subject_id} - Ensemble (TOP_K={top_k}, R2={r2:.3f}, MAE={mae:.2f}, PCC={pcc if not np.isnan(pcc) else 0:.3f})")
             plt.xlabel("Cumulative Frame index (Segment Boundaries marked by dotted lines)")
             plt.ylabel("SpO2")
             plt.legend()
@@ -846,4 +1152,6 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
     print("\n" + "=" * 60)
     print("Ensemble 預測完成")
     print("=" * 60)
+    if return_frame_predictions:
+        return results_df, pd.DataFrame(frame_prediction_rows)
     return results_df
