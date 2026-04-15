@@ -1,6 +1,6 @@
 """
 推論腳本：載入已儲存的 model pool 與設定，對「每個 CSV 分別」做 ensemble 推論，
-並將各 CSV 的 平均 PCC、整體 PCC、平均 R²、平均 MAE 彙總成一個 .csv。
+並將各 CSV 的 平均 PCC、整體 PCC、平均 R2、平均 MAE 彙總成一個 .csv。
 """
 import os
 import json
@@ -24,7 +24,11 @@ CONFIG_FILENAME = "model_pool_config.json"
 # 若為 None，則使用訓練時儲存在 config 裡的 DATA_CSV_PATHS
 # INFER_CSV_PATHS = None
 # 例如:
-INFER_CSV_PATHS = ["./data/prc-c920.csv", "./data/prc-i15.csv", "./data/prc-i15m.csv"]
+INFER_CSV_PATHS = [
+    "./data_new/prc2-c930.csv",
+    "./data_new/prc2-i16.csv",
+    "./data_new/prc2-i16m.csv",
+]
 
 # 是否儲存每個 subject 的預測圖
 SAVE_PLOTS = True
@@ -135,7 +139,7 @@ def main():
         })
 
         overall_pcc_str = f"{overall_pcc:.4f}" if overall_pcc is not None and not pd.isna(overall_pcc) else "N/A"
-        print(f"\n  [{csv_name}] 平均 PCC = {mean_pcc:.4f}, 整體 PCC = {overall_pcc_str}, 平均 R² = {mean_r2:.4f}, 平均 MAE = {mean_mae:.4f}")
+        print(f"\n  [{csv_name}] 平均 PCC = {mean_pcc:.4f}, 整體 PCC = {overall_pcc_str}, 平均 R2 = {mean_r2:.4f}, 平均 MAE = {mean_mae:.4f}")
 
     summary_df = pd.DataFrame(summary_rows)
     summary_path = os.path.join(output_dir, f"infer_summary_topk{top_k}_seg{segment_length}.csv")

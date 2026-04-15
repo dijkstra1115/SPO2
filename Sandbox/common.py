@@ -28,7 +28,7 @@ USE_REGULARIZATION = True
 ALPHA = 1.0
 
 # Ensemble 模型池預設
-TOP_K = 25
+TOP_K = 20
 SEGMENT_LENGTH = 900
 
 # rPPG / HR 相關參數
@@ -37,12 +37,12 @@ HR_UPDATE_SEC = 15       # HR 重新計算間隔（秒）
 MIN_RPPG_FRAMES = 512   # 穩定計算 HR 所需最少 rPPG frames
 BW = 0.2                # 帶通濾波帶寬 ±Hz
 
-# 模型池過濾閾值：訓練集 R² / PCC 低於此值的段不加入模型池
+# 模型池過濾閾值：訓練集 R2 / PCC 低於此值的段不加入模型池
 MIN_TRAIN_R2 = 0.2
 MIN_TRAIN_PCC = 0.2
 
-# Subject 級 SpO2 跨幅篩選：僅保留「該 subject 所有 segment 串起來後」SpO2 最大最小值差值 >= 此值的 subject
-MIN_SPO2_RANGE = 10
+# Subject 級 SpO2 跨幅篩選
+MIN_SpO2_RANGE = 10
 
 # 模型與設定儲存目錄（train.py 會寫入此目錄，infer.py 由此載入）
 MODEL_DIR = os.path.join(OUTPUT_DIR, "model")
@@ -52,7 +52,7 @@ CHANNEL_ORDER = ["cg", "cr", "yiq_i", "dbdr_dr", "pos_y", "chrom_x"]
 all_channel_names = ["R", "G", "B", "RoR_RG", "RoR_RB"]
 
 # RGB 均值欄位（用於 model selection 時的 RGB 相似度）
-rgb_mean_col_names = ["R_mean", "G_mean", "B_mean"]
+rgb_win_last_col_names = ["R_win_last", "G_win_last", "B_win_last"]
 # Additional derived features for global model only
 derived_acdc_col_names = ["POS_Y_acdc", "CHROM_X_acdc",
                           "R_acdc_long", "G_acdc_long", "B_acdc_long",
@@ -203,7 +203,7 @@ def build_features_from_df(df, source_name=None):
         R = g["COLOR_R"].values.astype(float)
         G = g["COLOR_G"].values.astype(float)
         B = g["COLOR_B"].values.astype(float)
-        SPO2 = g["SPO2"].values.astype(float)
+        SpO2 = g["SpO2"].values.astype(float)
         N = len(g)
 
         if N < MIN_RPPG_FRAMES + WIN_LEN:
@@ -263,17 +263,17 @@ def build_features_from_df(df, source_name=None):
         first_start = max(0, MIN_RPPG_FRAMES - WIN_LEN + 1)
         for start in range(first_start, N - WIN_LEN + 1, STEP):
             end = start + WIN_LEN
-            y = float(SPO2[end - 1])
+            y = float(SpO2[end - 1])
 
             # 【修改 2】：將 folder_name 也存入特徵中
-            row = {"subject_id": effective_id, "subject_group": subject_group, "folder_name": folder_name, "SPO2_win_mean": y}
+            row = {"subject_id": effective_id, "subject_group": subject_group, "folder_name": folder_name, "SpO2_win_last": y}
             for ch_name, filt_arr, orig_arr in [("R", r_filtered, R),
                                                   ("G", g_filtered, G),
                                                   ("B", b_filtered, B)]:
                 ac = np.std(filt_arr[start:end])
                 dc = np.mean(orig_arr[start:end])
                 row[f"{ch_name}_acdc"] = (ac / dc) if dc >= 1e-6 else 0.0
-                row[f"{ch_name}_mean"] = float(orig_arr[end - 1])
+                row[f"{ch_name}_win_last"] = float(orig_arr[end - 1])
             # Ratio of Ratios features (classic SpO2 estimation principle)
             r_acdc = row["R_acdc"]
             g_acdc = row["G_acdc"]
@@ -345,6 +345,11 @@ def load_features_from_csv_paths(csv_paths, verbose=True):
         if verbose:
             print(f"File: {csv_path}")
         df = pd.read_csv(csv_path)
+        # Normalize SpO2 column name (some CSVs use SPo2, others SpO2 or SPO2)
+        for col in df.columns:
+            if col.upper() == "SPO2" and col != "SpO2":
+                df = df.rename(columns={col: "SpO2"})
+                break
         source_name = os.path.splitext(os.path.basename(csv_path))[0]
         all_rows.extend(build_features_from_df(df, source_name=source_name))
     feat_df = pd.DataFrame(all_rows)
@@ -354,7 +359,7 @@ def load_features_from_csv_paths(csv_paths, verbose=True):
     return feat_df
 
 
-def filter_feat_df_by_spo2_range(feat_df, min_range=MIN_SPO2_RANGE, segment_length=None, verbose=True):
+def filter_feat_df_by_spo2_range(feat_df, min_range=MIN_SpO2_RANGE, segment_length=None, verbose=True):
     """
     依「同一 subject_id 下會被用來訓練/評估的 SpO2 跨幅」篩選 subject。
     - 若提供 segment_length：只考慮「該 folder 樣本數 >= segment_length」的 rows 來算跨幅，
@@ -362,7 +367,7 @@ def filter_feat_df_by_spo2_range(feat_df, min_range=MIN_SPO2_RANGE, segment_leng
     - 僅保留跨幅 >= min_range 的 subject。
     回傳篩選後的 DataFrame（不修改原 DataFrame）。
     """
-    if "subject_id" not in feat_df.columns or "SPO2_win_mean" not in feat_df.columns:
+    if "subject_id" not in feat_df.columns or "SpO2_win_last" not in feat_df.columns:
         return feat_df
     if "folder_name" not in feat_df.columns and segment_length is not None:
         segment_length = None  # 無法依 folder 過濾時退化成用全部 rows
@@ -375,7 +380,7 @@ def filter_feat_df_by_spo2_range(feat_df, min_range=MIN_SPO2_RANGE, segment_leng
     else:
         df_for_range = feat_df
 
-    agg = df_for_range.groupby("subject_id")["SPO2_win_mean"].agg(["min", "max"])
+    agg = df_for_range.groupby("subject_id")["SpO2_win_last"].agg(["min", "max"])
     agg["spo2_range"] = agg["max"] - agg["min"]
     valid_subject_ids = agg.index[agg["spo2_range"] >= min_range].tolist()
     dropped = agg.index[agg["spo2_range"] < min_range].tolist()
@@ -472,14 +477,17 @@ def calculate_rgb_similarity(rgb_mean_a, rgb_mean_b):
 
 def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH,
                      use_normalization=USE_NORMALIZATION, use_regularization=USE_REGULARIZATION, alpha=ALPHA,
-                     min_train_r2=MIN_TRAIN_R2, min_train_pcc=MIN_TRAIN_PCC):
+                     min_train_r2=MIN_TRAIN_R2, min_train_pcc=MIN_TRAIN_PCC,
+                     reverse_ratio=0.0, random_seed=42):
     """
     訓練所有 subject 的模型並建構模型池（使用 Folder 獨立切分策略）。
-    回傳 model_pool: list of dict（每項含 subject_id, folder_name, segment_id, model_id, model, feature_cols, weights, bias, means, stds, X_raw_segment）。
+    reverse_ratio: 隨機反轉的 folder 比例（0.0~1.0），增加資料多樣性。
+    回傳 model_pool: list of dict。
     """
     print("\n" + "=" * 60)
-    print(f"訓練模型池（段長度={segment_length}，依 Folder 獨立切割）...")
+    print(f"訓練模型池（段長度={segment_length}，依 Folder 獨立切割, 反轉比例={reverse_ratio}）...")
     print("=" * 60)
+    rng = np.random.RandomState(random_seed)
     
     if selected_channels is None:
         used_channels = all_channel_names
@@ -489,7 +497,7 @@ def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH,
     feature_cols = [f"{ch}_acdc" for ch in used_channels]
     
     # 確保特徵中包含 folder_name
-    req_cols = ["subject_id", "folder_name", "SPO2_win_mean"] + feature_cols + rgb_mean_col_names
+    req_cols = ["subject_id", "folder_name", "SpO2_win_last"] + feature_cols + rgb_win_last_col_names
     if "folder_name" not in feat_df.columns:
         raise ValueError("特徵 DataFrame 缺少 'folder_name' 欄位，請確認 build_features_from_df 是否已更新！")
         
@@ -504,8 +512,9 @@ def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH,
     # 第一層：依照 subject_id 分組
     for subject_id, subdf in feat_df_selected.groupby("subject_id", sort=False):
         n_samples_sub = len(subdf)
+        subject_seg_count = 0
         print(f"\n處理 Subject {subject_id}: 總共 {n_samples_sub} 個樣本")
-        
+
         # 第二層：依照 folder_name (片段) 分組，確保 Segment 不跨 Folder
         for folder_name, folder_df in subdf.groupby("folder_name", sort=False):
             n_samples = len(folder_df)
@@ -515,11 +524,18 @@ def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH,
                 continue
                 
             n_segments = n_samples // segment_length
-            print(f"  Folder {folder_name}: {n_samples} 樣本，可切為 {n_segments} 段")
-            
+
+            # 隨機反轉 folder（增加資料多樣性，讓模型不依賴時間方向）
+            is_reversed = reverse_ratio > 0 and rng.rand() < reverse_ratio
+            if is_reversed:
+                folder_df = folder_df.iloc[::-1].reset_index(drop=True)
+
+            rev_tag = " [REV]" if is_reversed else ""
+            print(f"  Folder {folder_name}: {n_samples} 樣本，可切為 {n_segments} 段{rev_tag}")
+
             X_full = folder_df[feature_cols].astype(float)
-            rgb_mean_full = folder_df[rgb_mean_col_names].astype(float)
-            y_full = folder_df["SPO2_win_mean"].values.astype(float)
+            rgb_mean_full = folder_df[rgb_win_last_col_names].astype(float)
+            y_full = folder_df["SpO2_win_last"].values.astype(float)
 
             for seg_idx in range(n_segments):
                 start_idx = seg_idx * segment_length
@@ -564,7 +580,7 @@ def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH,
                     train_pcc = train_pcc if not np.isnan(train_pcc) else -1.0
 
                 if train_r2 <= min_train_r2:
-                    print(f"    段 {seg_idx}: 跳過（訓練集 R² = {train_r2:.4f} <= {min_train_r2}）")
+                    print(f"    段 {seg_idx}: 跳過（訓練集 R2 = {train_r2:.4f} <= {min_train_r2}）")
                     filtered_by_r2 += 1
                     continue
                 if train_pcc <= min_train_pcc:
@@ -593,16 +609,17 @@ def train_model_pool(selected_channels, feat_df, segment_length=SEGMENT_LENGTH,
                     'spo2_std': float(np.std(y_segment)),
                 })
                 total_segments += 1
-        print(f"  Subject {subject_id} 完成")
+                subject_seg_count += 1
+        print(f"  Subject {subject_id} 完成 ({subject_seg_count} segments)")
 
     print(f"\n模型池建構完成:")
     print(f"  最終模型池大小: {len(model_pool)} 個模型")
-    print(f"  過濾統計: R²不足({filtered_by_r2}), PCC不足({filtered_by_pcc})")
+    print(f"  過濾統計: R2不足({filtered_by_r2}), PCC不足({filtered_by_pcc})")
     print("=" * 60)
     return model_pool
 
 
-GLOBAL_MODEL_BLEND = 0.35  # Blend weight for global LOSO model (0 = ensemble only, 1 = global only)
+GLOBAL_MODEL_BLEND = 0.2  # Blend weight for global LOSO model (0 = ensemble only, 1 = global only)
 
 
 def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
@@ -626,7 +643,7 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
         used_channels = [ch for ch in selected_channels if ch in all_channel_names]
         
     feature_cols = [f"{ch}_acdc" for ch in used_channels]
-    req_cols = ["subject_id", "subject_group", "folder_name", "SPO2_win_mean"] + feature_cols + rgb_mean_col_names + derived_acdc_col_names
+    req_cols = ["subject_id", "subject_group", "folder_name", "SpO2_win_last"] + feature_cols + rgb_win_last_col_names + derived_acdc_col_names
     feat_df_selected = feat_df[req_cols].copy()
 
     results = []
@@ -644,9 +661,9 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
             from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
             train_df = feat_df_selected[feat_df_selected["subject_group"] != test_subject_group]
             # Use feature cols, RGB means, and derived channel features for global model
-            global_feature_cols = feature_cols + [c for c in rgb_mean_col_names if c not in feature_cols] + derived_acdc_col_names
+            global_feature_cols = feature_cols + [c for c in rgb_win_last_col_names if c not in feature_cols] + derived_acdc_col_names
             X_global_train = train_df[global_feature_cols].values.astype(float)
-            y_global_train = train_df["SPO2_win_mean"].values.astype(float)
+            y_global_train = train_df["SpO2_win_last"].values.astype(float)
             if len(X_global_train) > 10:
                 global_model = HistGradientBoostingRegressor(
                     max_iter=300, max_depth=3, learning_rate=0.03,
@@ -670,8 +687,8 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
             total_segments = math.ceil(n_samples / segment_length) 
             
             X_test_full = folder_df[feature_cols].astype(float)
-            rgb_mean_test_full = folder_df[rgb_mean_col_names].astype(float)
-            y_test_full = folder_df["SPO2_win_mean"].values.astype(float)
+            rgb_mean_test_full = folder_df[rgb_win_last_col_names].astype(float)
+            y_test_full = folder_df["SpO2_win_last"].values.astype(float)
             
             last_top_k_models = None 
 
@@ -735,7 +752,6 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
 
                 segment_preds = []
                 sim_weights = []
-                train_spo2_stats = []  # (mean, std) per model
                 for sim_info in top_k_models:
                     m = sim_info['model_info']
                     y_p = np.dot(X_test_input[m['feature_cols']].values, m['weights']) + m['bias']
@@ -744,13 +760,10 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                     segment_preds.append(y_p)
                     w = max(sim_info['combined'], 0.01)
                     sim_weights.append(w)
-                    train_spo2_stats.append((m.get('spo2_mean', 95.0), m.get('spo2_std', 3.0)))
 
                 if len(segment_preds) > 0:
                     preds_arr = np.array(segment_preds)
                     weights_arr = np.array(sim_weights)
-                    train_means_arr = np.array([s[0] for s in train_spo2_stats])
-                    train_stds_arr = np.array([s[1] for s in train_spo2_stats])
                     # Consensus filtering
                     med_pred = np.median(preds_arr, axis=0)
                     deviations = np.mean(np.abs(preds_arr - med_pred), axis=1)
@@ -759,20 +772,18 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                     if np.sum(keep_mask) >= 3:
                         preds_arr = preds_arr[keep_mask]
                         weights_arr = weights_arr[keep_mask]
-                        train_means_arr = train_means_arr[keep_mask]
-                        train_stds_arr = train_stds_arr[keep_mask]
                     # Weighted average
                     weights_arr = weights_arr / weights_arr.sum()
                     avg_pred = np.average(preds_arr, axis=0, weights=weights_arr)
                     # Blend with global LOSO model
                     if global_model is not None and GLOBAL_MODEL_BLEND > 0:
-                        global_feature_cols = feature_cols + [c for c in rgb_mean_col_names if c not in feature_cols] + derived_acdc_col_names
-                        rgb_mean_test_seg = folder_df[rgb_mean_col_names].iloc[start_idx:end_idx].astype(float)
+                        global_feature_cols = feature_cols + [c for c in rgb_win_last_col_names if c not in feature_cols] + derived_acdc_col_names
+                        rgb_mean_test_seg = folder_df[rgb_win_last_col_names].iloc[start_idx:end_idx].astype(float)
                         derived_test_seg = folder_df[derived_acdc_col_names].iloc[start_idx:end_idx].astype(float)
                         X_global_test = pd.concat([X_test_segment_df[feature_cols], rgb_mean_test_seg, derived_test_seg], axis=1)
                         global_pred = global_model.predict(X_global_test.values)
                         avg_pred = (1 - GLOBAL_MODEL_BLEND) * avg_pred + GLOBAL_MODEL_BLEND * global_pred
-                    avg_pred = np.clip(avg_pred, 70, 100)
+                    avg_pred = np.clip(avg_pred, 50, 100)
                     subject_segment_predictions.append(avg_pred)
                     subject_segment_labels.append(y_test_segment)
 
@@ -784,21 +795,21 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
         y_test = np.concatenate(subject_segment_labels)
 
         # Rolling median smoothing to reduce prediction noise
-        smooth_window = 1801  # ~60 seconds at 30fps, must be odd
+        smooth_window = 301  # ~10 seconds at 30fps, must be odd
         if len(y_ensemble) >= smooth_window:
             y_smoothed = pd.Series(y_ensemble).rolling(window=smooth_window, center=True, min_periods=1).median().values
             y_ensemble = y_smoothed
 
         # Second-pass EMA smoothing for additional noise reduction
-        ema_span = 901  # ~30 seconds at 30fps
+        ema_span = 151  # ~5 seconds at 30fps
         if len(y_ensemble) >= ema_span:
             y_ema = pd.Series(y_ensemble).ewm(span=ema_span, adjust=False).mean().values
             y_ensemble = y_ema
 
         # 防護：實際用於評估的資料跨幅若仍不足，跳過該 subject（不列入結果、不繪圖）
         subject_range = float(np.max(y_test) - np.min(y_test))
-        if subject_range < MIN_SPO2_RANGE:
-            print(f"  跳過 Subject {test_subject_id}: 實際用於評估的 SpO2 跨幅={subject_range:.2f} < {MIN_SPO2_RANGE}，不列入結果與繪圖")
+        if subject_range < MIN_SpO2_RANGE:
+            print(f"  跳過 Subject {test_subject_id}: 實際用於評估的 SpO2 跨幅={subject_range:.2f} < {MIN_SpO2_RANGE}，不列入結果與繪圖")
             continue
 
         r2 = r2_score(y_test, y_ensemble)
@@ -822,7 +833,7 @@ def ensemble_predict_and_evaluate(model_pool, feat_df, selected_channels, top_k,
                 current_pos += len(seg_pred)
                 plt.axvline(x=current_pos, color='blue', linestyle=':', alpha=0.3)
                 
-            plt.title(f"Subject {test_subject_id} - Ensemble (TOP_K={top_k}, R²={r2:.3f}, MAE={mae:.2f}, PCC={pcc if not np.isnan(pcc) else 0:.3f})")
+            plt.title(f"Subject {test_subject_id} - Ensemble (TOP_K={top_k}, R2={r2:.3f}, MAE={mae:.2f}, PCC={pcc if not np.isnan(pcc) else 0:.3f})")
             plt.xlabel("Cumulative Frame index (Segment Boundaries marked by dotted lines)")
             plt.ylabel("SpO2")
             plt.legend()

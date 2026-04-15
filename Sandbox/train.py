@@ -27,13 +27,13 @@ from common import (
 
 # 多 CSV 擴大模型池：可一次加入多個 .csv，合併後訓練
 DATA_CSV_PATHS = [
-    "./data/prc-c920.csv",
-    "./data/prc-i15.csv",
-    "./data/prc-i15m.csv",
-    "./data/prc2-c930.csv",
-    "./data/prc2-i16.csv",
-    "./data/prc2-i16m.csv",
+    "./data_new/prc2-c930.csv",
+    "./data_new/prc2-i16.csv",
+    "./data_new/prc2-i16m.csv",
 ]
+
+# 訓練時隨機反轉的 folder 比例
+REVERSE_RATIO = 0.0
 
 # 儲存檔名（可改為參數）
 MODEL_POOL_FILENAME = "model_pool.joblib"
@@ -76,7 +76,7 @@ def main():
     print("依 SpO2 跨幅篩選 subject（僅保留跨幅 >= 10，且僅以長度足夠的 folder 計算跨幅）...")
     feat_df_all = filter_feat_df_by_spo2_range(feat_df_all, segment_length=SEGMENT_LENGTH, verbose=True)
     if len(feat_df_all) == 0:
-        raise SystemExit("篩選後沒有剩餘樣本，請檢查 MIN_SPO2_RANGE 或資料。")
+        raise SystemExit("篩選後沒有剩餘樣本，請檢查 MIN_SpO2_RANGE 或資料。")
     print(f"篩選後樣本數: {len(feat_df_all)}, subject 數: {feat_df_all['subject_id'].nunique()}")
     print("=" * 60)
 
@@ -90,6 +90,7 @@ def main():
         use_normalization=USE_NORMALIZATION,
         use_regularization=USE_REGULARIZATION,
         alpha=ALPHA,
+        reverse_ratio=REVERSE_RATIO,
     )
 
     config = get_config()
